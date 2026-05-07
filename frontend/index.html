@@ -100,6 +100,26 @@
   </select>
   <select id="entity-type-filter">
     <option value="">All entity types</option>
+    <option value="IND">IND — Individual / Sole Trader</option>
+    <option value="PRV">PRV — Australian Private Company</option>
+    <option value="PUB">PUB — Australian Public Company</option>
+    <option value="SMF">SMF — Self-Managed Super Fund</option>
+    <option value="DIT">DIT — Discretionary Investment Trust</option>
+    <option value="DTT">DTT — Discretionary Trading Trust</option>
+    <option value="FPT">FPT — Family Partnership</option>
+    <option value="FUT">FUT — Fixed Unit Trust</option>
+    <option value="STR">STR — Strata-title</option>
+    <option value="OIE">OIE — Other Incorporated Entity</option>
+    <option value="PTR">PTR — Other Partnership</option>
+    <option value="UIE">UIE — Other Unincorporated Entity</option>
+    <option value="DES">DES — Deceased Estate</option>
+    <option value="GOV">GOV — Government</option>
+    <option value="CMT">CMT — Cash Management Trust</option>
+    <option value="LCT">LCT — Listed Public Company</option>
+    <option value="LPT">LPT — Limited Partnership</option>
+    <option value="ARF">ARF — APRA-Regulated Public Sector Fund</option>
+    <option value="NPF">NPF — Non-Profit Fund</option>
+    <option value="POF">POF — Pooled Superannuation Trust</option>
   </select>
   <select id="page-size">
     <option value="20">20 per page</option>
@@ -150,8 +170,18 @@
   let db, conn;
   let currentPage = 0;
   let totalRows = 0;
+  let manifestRowCount = null;  // populated from manifest.json on init
 
   async function init() {
+    status.textContent = 'Loading dataset metadata…';
+    // Fast: tiny JSON, gives us total row count without scanning parquet.
+    try {
+      const m = await fetch(`${DATA_BASE}/manifest.json`).then(r => r.json());
+      manifestRowCount = m.row_counts?.abn_main ?? null;
+    } catch (e) {
+      console.warn('manifest fetch failed:', e);
+    }
+
     status.textContent = 'Initialising DuckDB-WASM…';
     const bundles = duckdb.getJsDelivrBundles();
     const bundle = await duckdb.selectBundle(bundles);
@@ -161,28 +191,9 @@
     await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
     conn = await db.connect();
     await conn.query("INSTALL httpfs; LOAD httpfs;");
-    status.textContent = 'Loading entity types…';
-    await populateEntityTypes();
     status.className = 'status ready';
     status.textContent = `Ready · data from ${DATA_BASE}`;
     await refresh();
-  }
-
-  async function populateEntityTypes() {
-    const result = await conn.query(`
-      SELECT DISTINCT entity_type_ind AS code, MAX(entity_type_text) AS text
-      FROM read_parquet('${MAIN_URL}')
-      WHERE entity_type_ind IS NOT NULL
-      GROUP BY entity_type_ind
-      ORDER BY 1
-    `);
-    const sel = $('entity-type-filter');
-    for (const row of result.toArray().map(r => r.toJSON())) {
-      const opt = document.createElement('option');
-      opt.value = row.code;
-      opt.textContent = `${row.code} — ${row.text}`;
-      sel.appendChild(opt);
-    }
   }
 
   function buildWhere() {
@@ -223,7 +234,11 @@
     return Number(result.toArray()[0].toJSON().n);
   }
 
-  async function fetchPage({ where, params }, offset, limit) {
+  async function fetchPage({ where, params }, offset, limit, filtered) {
+    // ORDER BY abn is expensive on a 20M-row scan. Skip it when no filters
+    // are set — natural Parquet order is fine for "browse all" UX. With any
+    // filter, the result set is much smaller so the sort is cheap.
+    const orderBy = filtered ? 'ORDER BY abn' : '';
     const sql = `
       SELECT abn, main_name, individual_title, individual_given_names,
              individual_family_name, entity_kind, entity_type_ind,
@@ -231,7 +246,7 @@
              gst_status, asic_number
       FROM read_parquet('${MAIN_URL}')
       ${where}
-      ORDER BY abn
+      ${orderBy}
       LIMIT ? OFFSET ?
     `;
     const stmt = await conn.prepare(sql);
@@ -352,18 +367,39 @@
   async function refresh() {
     const pageSize = Number($('page-size').value);
     const filterSpec = buildWhere();
+    const filtered = filterSpec.params.length > 0;
     table.hidden = true; pagination.hidden = true;
     status.className = 'status';
-    status.textContent = 'Counting…';
+    status.textContent = filtered ? 'Filtering…' : 'Loading first page…';
     try {
-      totalRows = await countRows(filterSpec);
-      const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
-      if (currentPage >= totalPages) currentPage = 0;
-      status.textContent = `Querying page ${currentPage + 1} of ${totalPages.toLocaleString()}…`;
-      const records = await fetchPage(filterSpec, currentPage * pageSize, pageSize);
+      // Show the page first (fast), then update totals (slower, async).
+      const records = await fetchPage(filterSpec, currentPage * pageSize, pageSize, filtered);
       renderRows(records);
       table.hidden = false;
       pagination.hidden = false;
+
+      // Initial totals from manifest if no filter; otherwise actual count.
+      if (!filtered && manifestRowCount !== null) {
+        totalRows = manifestRowCount;
+        const totalPages = Math.ceil(totalRows / pageSize);
+        pageInfo.textContent = `Page ${(currentPage + 1).toLocaleString()} of ${totalPages.toLocaleString()} · ${totalRows.toLocaleString()} total`;
+        $('prev').disabled = currentPage === 0;
+        $('next').disabled = (currentPage + 1) >= totalPages;
+        status.className = 'status ready';
+        status.textContent = `Ready · ${totalRows.toLocaleString()} ABNs`;
+        return;
+      }
+
+      // For filtered queries we need an actual count.
+      pageInfo.textContent = `Page ${(currentPage + 1).toLocaleString()} · counting…`;
+      $('prev').disabled = currentPage === 0;
+      $('next').disabled = records.length < pageSize;  // optimistic until count returns
+      status.className = 'status';
+      status.textContent = 'Counting matches…';
+
+      totalRows = await countRows(filterSpec);
+      const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
+      if (currentPage >= totalPages) currentPage = 0;
       pageInfo.textContent = `Page ${(currentPage + 1).toLocaleString()} of ${totalPages.toLocaleString()} · ${totalRows.toLocaleString()} matches`;
       $('prev').disabled = currentPage === 0;
       $('next').disabled = (currentPage + 1) >= totalPages;
