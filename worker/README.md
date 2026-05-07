@@ -1,20 +1,18 @@
 # abr-api Worker
 
-Cloudflare Worker exposing the published dataset as JSON HTTP endpoints.
-
-## Status
-
-**Scaffolded.** The URL routes and response shapes are settled; query logic via DuckDB-WASM lands in a follow-up. Today the routes return placeholder responses with a `placeholder: true` field so callers can test the contract.
+Cloudflare Worker exposing the published dataset as JSON HTTP endpoints. DuckDB-WASM running inside the Worker reads parquets over HTTPS at `gazetteer.au`; the CF edge cache absorbs repeat range reads.
 
 ## Endpoints
 
-| Route | Description |
-|---|---|
-| `GET /` | API discovery |
-| `GET /manifest` | Latest `manifest.json`, cached 5 min |
-| `GET /abn/:abn` | Full profile for one ABN (placeholder) |
-| `GET /search?q=&in=&limit=` | Search by name (placeholder) |
-| `GET /trends/:metric?since=&by=` | Pre-baked aggregations (placeholder) |
+| Route | Description | Cache |
+|---|---|---|
+| `GET /` | API discovery | — |
+| `GET /manifest` | Latest `manifest.json` proxy | 5 min |
+| `GET /abn/:abn` | Full profile for one ABN | 1 hr |
+| `GET /search?q=&in=&limit=` | Search by name | 10 min |
+| `GET /trends/:metric?since=&by=` | Pre-baked aggregations | 1 day |
+
+Response shapes match the Python CLI (`abr-extract profile/search/trends`) — same SQL, same JSON.
 
 ## Local development
 
@@ -27,19 +25,22 @@ npm run dev   # local dev server on http://localhost:8787
 ## Deploy
 
 ```bash
+cd worker
+npx wrangler login    # one-time
 npx wrangler deploy
 ```
 
-Wrangler reads `wrangler.toml` for the R2 binding and the public data URL.
+Wrangler reads `wrangler.toml` for the R2 binding and the public data URL. The Worker code reads parquets via HTTPS at `DATA_BASE_URL`, not via the R2 binding (the binding is configured for the future Iceberg integration).
 
-## R2 binding
+## Cold start
 
-`DATA_BUCKET` is bound to `weekly-abr-dataset` for direct R2 reads (used once DuckDB-WASM lands). Until then the placeholder routes use the public r2.dev URL via `DATA_BASE_URL`.
+DuckDB-WASM initializes once per Worker isolate (~1–2s for the first request). Subsequent requests on the same isolate reuse the connection. CF edge cache means hot keys (e.g. popular ABNs) respond from cache without hitting the Worker at all.
 
-## Plan for query layer
+## Bundle size note
 
-- **For `/abn/:abn` (point lookup):** DuckDB-WASM with predicate pushdown. ABN is the natural sort key candidate, expecting <500 ms after warm cold-start.
-- **For `/search`:** full main-name scan — 2–5s. Hot queries cached in CF cache.
-- **For `/trends/:metric`:** pre-baked aggregations are tiny (KB) and load instantly from cache. Other metrics computed on demand.
+`@duckdb/duckdb-wasm` ships a few MB of WASM. If the bundle exceeds the Workers free-tier 1 MB compressed limit, the Workers paid plan ($5/mo) raises that to 10 MB. Bundle size is checked at `wrangler deploy` time.
 
-When R2 Data Catalog + DuckDB-Wasm Iceberg reads are stable, we switch the source from snapshot Parquets to the Iceberg history tables for `--at-date` time-travel.
+## What's not here yet
+
+- Iceberg time-travel queries (`?at=2025-06-30`) — wired once `R2_CATALOG_TOKEN` lands and the Iceberg pipeline run is verified.
+- Authenticated/paid tiers — currently anonymous, public, rate-limited only by Workers' built-in protections.
