@@ -21,6 +21,10 @@ outputs/
 *.sqlite
 *.duckdb
 
+# But do track checked-in fixtures
+!tests/fixtures/
+!tests/fixtures/**
+
 .env
 .env.local
 *.log

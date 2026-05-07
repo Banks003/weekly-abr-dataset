@@ -12,6 +12,7 @@ from tqdm import tqdm
 from .catalog import USER_AGENT, Catalog, ZipResource
 
 CHUNK_SIZE = 1 << 20  # 1 MiB
+DEFAULT_TIMEOUT = httpx.Timeout(30.0, read=300.0)
 
 
 class DownloadError(RuntimeError):
@@ -45,7 +46,7 @@ def download_zip(
 
     own_client = client is None
     if own_client:
-        client = httpx.Client(headers={"User-Agent": USER_AGENT}, timeout=httpx.Timeout(30.0, read=300.0))
+        client = httpx.Client(headers={"User-Agent": USER_AGENT}, timeout=DEFAULT_TIMEOUT)
 
     digest = hashlib.sha256()
     bytes_written = 0
@@ -58,7 +59,8 @@ def download_zip(
             expected = int(content_length) if content_length else None
             if expected is not None and expected != resource.size_bytes:
                 raise DownloadError(
-                    f"Content-Length {expected} != catalog size {resource.size_bytes} for {resource.name}"
+                    f"Content-Length {expected} != catalog size {resource.size_bytes} "
+                    f"for {resource.name}"
                 )
 
             progress = (
@@ -117,7 +119,7 @@ def download_all(
 ) -> list[DownloadResult]:
     own_client = client is None
     if own_client:
-        client = httpx.Client(headers={"User-Agent": USER_AGENT}, timeout=httpx.Timeout(30.0, read=300.0))
+        client = httpx.Client(headers={"User-Agent": USER_AGENT}, timeout=DEFAULT_TIMEOUT)
     try:
         return [
             download_zip(z, output_dir, client=client, show_progress=show_progress)

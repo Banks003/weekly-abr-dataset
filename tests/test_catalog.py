@@ -5,7 +5,6 @@ from unittest.mock import MagicMock
 
 from abr_extract.catalog import Catalog, ZipResource, fetch_catalog
 
-
 CKAN_FIXTURE = {
     "success": True,
     "result": {

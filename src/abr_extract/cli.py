@@ -14,8 +14,16 @@ def main() -> None:
 
 
 @main.command()
-@click.option("--output-dir", default="./work", help="Directory for downloaded zips and intermediate files.")
-@click.option("--skip-publish", is_flag=True, help="Build artefacts locally without uploading to R2.")
+@click.option(
+    "--output-dir",
+    default="./work",
+    help="Directory for downloaded zips and intermediate files.",
+)
+@click.option(
+    "--skip-publish",
+    is_flag=True,
+    help="Build artefacts locally without uploading to R2.",
+)
 @click.option("--force", is_flag=True, help="Run even if the source extract is unchanged.")
 def run(output_dir: str, skip_publish: bool, force: bool) -> None:
     raise NotImplementedError("Pipeline not yet implemented")
@@ -43,7 +51,10 @@ def check() -> None:
     total = sum(z.size_bytes for z in catalog.zips)
     click.echo(f"Zip resources: {len(catalog.zips)} ({total / 1_000_000:.1f} MB total)")
     for z in catalog.zips:
-        click.echo(f"  - {z.name}: {z.size_bytes / 1_000_000:.1f} MB, modified {z.last_modified.isoformat()}")
+        click.echo(
+            f"  - {z.name}: {z.size_bytes / 1_000_000:.1f} MB, "
+            f"modified {z.last_modified.isoformat()}"
+        )
         click.echo(f"    {z.url}")
     if catalog.schema_xsd_url:
         click.echo(f"Schema: {catalog.schema_xsd_url}")

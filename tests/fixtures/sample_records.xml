@@ -1,0 +1,284 @@
+<?xml version='1.0' encoding='utf-8'?>
+<Transfer error="none">
+  <TransferInfo>
+    <FileSequenceNumber>1</FileSequenceNumber>
+    <RecordCount>9</RecordCount>
+    <ExtractTime>2026-05-06T12:23:33</ExtractTime>
+  </TransferInfo>
+  <ABR recordLastUpdatedDate="20180216" replaced="N">
+    <ABN status="ACT" ABNStatusFromDate="19991101">11000000948</ABN>
+    <EntityType>
+      <EntityTypeInd>PUB</EntityTypeInd>
+      <EntityTypeText>Australian Public Company</EntityTypeText>
+    </EntityType>
+    <MainEntity>
+      <NonIndividualName type="MN">
+        <NonIndividualNameText>QBE INSURANCE (INTERNATIONAL) LTD</NonIndividualNameText>
+      </NonIndividualName>
+      <BusinessAddress>
+        <AddressDetails>
+          <State>NSW</State>
+          <Postcode>2000</Postcode>
+        </AddressDetails>
+      </BusinessAddress>
+    </MainEntity>
+    <ASICNumber ASICNumberType="undetermined">000000948</ASICNumber>
+    <GST status="ACT" GSTStatusFromDate="20000701" />
+    <OtherEntity>
+      <NonIndividualName type="TRD">
+        <NonIndividualNameText>QBE INSURANCE (INTERNATIONAL) LIMITED</NonIndividualNameText>
+      </NonIndividualName>
+    </OtherEntity>
+  </ABR>
+  <ABR recordLastUpdatedDate="20190531" replaced="N">
+    <ABN status="CAN" ABNStatusFromDate="20190501">11000002568</ABN>
+    <EntityType>
+      <EntityTypeInd>PRV</EntityTypeInd>
+      <EntityTypeText>Australian Private Company</EntityTypeText>
+    </EntityType>
+    <MainEntity>
+      <NonIndividualName type="MN">
+        <NonIndividualNameText>TOOHEYS PTY LIMITED</NonIndividualNameText>
+      </NonIndividualName>
+      <BusinessAddress>
+        <AddressDetails>
+          <State>NSW</State>
+          <Postcode>2141</Postcode>
+        </AddressDetails>
+      </BusinessAddress>
+    </MainEntity>
+    <ASICNumber ASICNumberType="undetermined">000002568</ASICNumber>
+    <GST status="CAN" GSTStatusFromDate="20190502" />
+  </ABR>
+  <ABR recordLastUpdatedDate="20170727" replaced="N">
+    <ABN status="CAN" ABNStatusFromDate="20141218">11000009496</ABN>
+    <EntityType>
+      <EntityTypeInd>PRV</EntityTypeInd>
+      <EntityTypeText>Australian Private Company</EntityTypeText>
+    </EntityType>
+    <MainEntity>
+      <NonIndividualName type="MN">
+        <NonIndividualNameText>PIONEER STEEL PTY LTD</NonIndividualNameText>
+      </NonIndividualName>
+      <BusinessAddress>
+        <AddressDetails>
+          <State>NSW</State>
+          <Postcode>2000</Postcode>
+        </AddressDetails>
+      </BusinessAddress>
+    </MainEntity>
+    <ASICNumber ASICNumberType="undetermined">000009496</ASICNumber>
+    <GST status="NON" GSTStatusFromDate="19000101" />
+    <OtherEntity>
+      <NonIndividualName type="OTN">
+        <NonIndividualNameText>PIONEER STEEL PTY LTD (IN LIQUIDATION)</NonIndividualNameText>
+      </NonIndividualName>
+    </OtherEntity>
+  </ABR>
+  <ABR recordLastUpdatedDate="20230722" replaced="N">
+    <ABN status="ACT" ABNStatusFromDate="20000507">11000013098</ABN>
+    <EntityType>
+      <EntityTypeInd>PRV</EntityTypeInd>
+      <EntityTypeText>Australian Private Company</EntityTypeText>
+    </EntityType>
+    <MainEntity>
+      <NonIndividualName type="MN">
+        <NonIndividualNameText>SYDNEY NIGHT PATROL &amp; INQUIRY CO PTY LTD</NonIndividualNameText>
+      </NonIndividualName>
+      <BusinessAddress>
+        <AddressDetails>
+          <State>NSW</State>
+          <Postcode>2113</Postcode>
+        </AddressDetails>
+      </BusinessAddress>
+    </MainEntity>
+    <ASICNumber ASICNumberType="undetermined">000013098</ASICNumber>
+    <GST status="ACT" GSTStatusFromDate="20000701" />
+    <OtherEntity>
+      <NonIndividualName type="TRD">
+        <NonIndividualNameText>SNP SECURITY</NonIndividualNameText>
+      </NonIndividualName>
+    </OtherEntity>
+    <OtherEntity>
+      <NonIndividualName type="OTN">
+        <NonIndividualNameText>SECURITY NETWORK PROTECTION</NonIndividualNameText>
+      </NonIndividualName>
+    </OtherEntity>
+    <OtherEntity>
+      <NonIndividualName type="BN">
+        <NonIndividualNameText>BCD SECURITY ALARM MONITORING SERVICES</NonIndividualNameText>
+      </NonIndividualName>
+    </OtherEntity>
+    <OtherEntity>
+      <NonIndividualName type="BN">
+        <NonIndividualNameText>Certis Security Australia</NonIndividualNameText>
+      </NonIndividualName>
+    </OtherEntity>
+    <OtherEntity>
+      <NonIndividualName type="BN">
+        <NonIndividualNameText>FORSTER-TUNCURRY SECURITY SERVICE</NonIndividualNameText>
+      </NonIndividualName>
+    </OtherEntity>
+    <OtherEntity>
+      <NonIndividualName type="BN">
+        <NonIndividualNameText>PSI Corporate</NonIndividualNameText>
+      </NonIndividualName>
+    </OtherEntity>
+    <OtherEntity>
+      <NonIndividualName type="BN">
+        <NonIndividualNameText>PSI Corporate Security</NonIndividualNameText>
+      </NonIndividualName>
+    </OtherEntity>
+    <OtherEntity>
+      <NonIndividualName type="BN">
+        <NonIndividualNameText>SNP SECURITY</NonIndividualNameText>
+      </NonIndividualName>
+    </OtherEntity>
+    <OtherEntity>
+      <NonIndividualName type="BN">
+        <NonIndividualNameText>SNP SECURITY</NonIndividualNameText>
+      </NonIndividualName>
+    </OtherEntity>
+    <OtherEntity>
+      <NonIndividualName type="BN">
+        <NonIndividualNameText>STREET BEAT SECURITY</NonIndividualNameText>
+      </NonIndividualName>
+    </OtherEntity>
+    <OtherEntity>
+      <NonIndividualName type="BN">
+        <NonIndividualNameText>Z.S.S SECURITY</NonIndividualNameText>
+      </NonIndividualName>
+    </OtherEntity>
+  </ABR>
+  <ABR recordLastUpdatedDate="20260211" replaced="N">
+    <ABN status="ACT" ABNStatusFromDate="20000224">11000047950</ABN>
+    <EntityType>
+      <EntityTypeInd>PUB</EntityTypeInd>
+      <EntityTypeText>Australian Public Company</EntityTypeText>
+    </EntityType>
+    <MainEntity>
+      <NonIndividualName type="MN">
+        <NonIndividualNameText>SYDNEY MISSIONARY &amp; BIBLE COLLEGE</NonIndividualNameText>
+      </NonIndividualName>
+      <BusinessAddress>
+        <AddressDetails>
+          <State>NSW</State>
+          <Postcode>2132</Postcode>
+        </AddressDetails>
+      </BusinessAddress>
+    </MainEntity>
+    <ASICNumber ASICNumberType="undetermined">000047950</ASICNumber>
+    <GST status="ACT" GSTStatusFromDate="20000701" />
+    <DGR status="ACT" DGRStatusFromDate="20060301" />
+    <DGR DGRStatusFromDate="20000701">
+      <NonIndividualName type="DGR">
+        <NonIndividualNameText>SYDNEY MISSIONARY &amp; BIBLE COLLEGE BUILDING &amp; MAINTENANCE FUND</NonIndividualNameText>
+      </NonIndividualName>
+    </DGR>
+    <OtherEntity>
+      <NonIndividualName type="TRD">
+        <NonIndividualNameText>SYDNEY MISSIONARY &amp; BIBLE COLLEGE</NonIndividualNameText>
+      </NonIndividualName>
+    </OtherEntity>
+    <OtherEntity>
+      <NonIndividualName type="BN">
+        <NonIndividualNameText>SMBC's The Bridge</NonIndividualNameText>
+      </NonIndividualName>
+    </OtherEntity>
+  </ABR>
+  <ABR recordLastUpdatedDate="20181025" replaced="N">
+    <ABN status="CAN" ABNStatusFromDate="20161231">11001032430</ABN>
+    <EntityType>
+      <EntityTypeInd>IND</EntityTypeInd>
+      <EntityTypeText>Individual/Sole Trader</EntityTypeText>
+    </EntityType>
+    <LegalEntity>
+      <IndividualName type="LGL">
+        <GivenName>JOHN</GivenName>
+        <GivenName>MCLEOD</GivenName>
+        <FamilyName>DUFF</FamilyName>
+      </IndividualName>
+      <BusinessAddress>
+        <AddressDetails>
+          <State>WA</State>
+          <Postcode>6084</Postcode>
+        </AddressDetails>
+      </BusinessAddress>
+    </LegalEntity>
+    <GST status="CAN" GSTStatusFromDate="20161231" />
+  </ABR>
+  <ABR recordLastUpdatedDate="20081120" replaced="N">
+    <ABN status="CAN" ABNStatusFromDate="20081103">11001572575</ABN>
+    <EntityType>
+      <EntityTypeInd>IND</EntityTypeInd>
+      <EntityTypeText>Individual/Sole Trader</EntityTypeText>
+    </EntityType>
+    <LegalEntity>
+      <IndividualName type="LGL">
+        <NameTitle>MR</NameTitle>
+        <GivenName>WILLIAM</GivenName>
+        <GivenName>RICHARD</GivenName>
+        <FamilyName>LITT</FamilyName>
+      </IndividualName>
+      <BusinessAddress>
+        <AddressDetails>
+          <State>NSW</State>
+          <Postcode>2646</Postcode>
+        </AddressDetails>
+      </BusinessAddress>
+    </LegalEntity>
+    <GST status="NON" GSTStatusFromDate="19000101" />
+    <OtherEntity>
+      <NonIndividualName type="TRD">
+        <NonIndividualNameText>WR LITT</NonIndividualNameText>
+      </NonIndividualName>
+    </OtherEntity>
+  </ABR>
+  <ABR recordLastUpdatedDate="20151113" replaced="N">
+    <ABN status="CAN" ABNStatusFromDate="20151102">11003615606</ABN>
+    <EntityType>
+      <EntityTypeInd>IND</EntityTypeInd>
+      <EntityTypeText>Individual/Sole Trader</EntityTypeText>
+    </EntityType>
+    <LegalEntity>
+      <IndividualName type="LGL">
+        <GivenName>ANDREW</GivenName>
+        <GivenName>DOUGLAS</GivenName>
+        <FamilyName>MURLEY</FamilyName>
+      </IndividualName>
+      <BusinessAddress>
+        <AddressDetails>
+          <State />
+          <Postcode>0000</Postcode>
+        </AddressDetails>
+      </BusinessAddress>
+    </LegalEntity>
+    <GST status="NON" GSTStatusFromDate="19000101" />
+    <OtherEntity>
+      <NonIndividualName type="TRD">
+        <NonIndividualNameText>Murley Construction</NonIndividualNameText>
+      </NonIndividualName>
+    </OtherEntity>
+  </ABR>
+  <ABR recordLastUpdatedDate="20160818" replaced="N">
+    <ABN status="CAN" ABNStatusFromDate="20160818">11005538314</ABN>
+    <EntityType>
+      <EntityTypeInd>IND</EntityTypeInd>
+      <EntityTypeText>Individual/Sole Trader</EntityTypeText>
+    </EntityType>
+    <LegalEntity>
+      <IndividualName type="LGL">
+        <GivenName>SIEW</GivenName>
+        <GivenName>LAN</GivenName>
+        <FamilyName>CHONG</FamilyName>
+      </IndividualName>
+      <BusinessAddress>
+        <AddressDetails>
+          <State />
+          <Postcode />
+        </AddressDetails>
+      </BusinessAddress>
+    </LegalEntity>
+    <GST status="NON" GSTStatusFromDate="19000101" />
+  </ABR>
+</Transfer>
