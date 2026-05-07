@@ -184,3 +184,38 @@ def ensure_history_tables(catalog: Catalog, namespace: str = "abr") -> dict[str,
         name: ensure_table(catalog, namespace, name, schema)
         for name, schema in TABLE_SCHEMAS.items()
     }
+
+
+def update_history_table(
+    table: Table,
+    snapshot_df: pl.DataFrame,
+    extract_date,
+    *,
+    bootstrap_fn,
+    apply_fn,
+    schema: Schema,
+) -> dict:
+    """Read prev history from Iceberg, apply bootstrap or SCD2 update, write back.
+
+    Returns a small summary dict for the manifest.
+    """
+    table.refresh()
+    try:
+        prev = pl.from_arrow(table.scan().to_arrow())
+    except Exception:
+        prev = pl.DataFrame()
+
+    if prev.height == 0:
+        history = bootstrap_fn(snapshot_df, extract_date)
+    else:
+        history = apply_fn(prev, snapshot_df, extract_date)
+
+    write_history(table, history, schema=schema)
+
+    open_rows = history.filter(pl.col("valid_to").is_null()).height
+    return {
+        "total_rows": history.height,
+        "open_rows": open_rows,
+        "closed_rows": history.height - open_rows,
+        "bootstrap": prev.height == 0,
+    }

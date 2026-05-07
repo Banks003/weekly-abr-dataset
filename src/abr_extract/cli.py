@@ -3,13 +3,30 @@ from __future__ import annotations
 import os
 import uuid
 import zipfile
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import click
 
 from .catalog import fetch_catalog
 from .download import download_all
+from .history import (
+    apply_update_dgr,
+    apply_update_main,
+    apply_update_trading,
+    bootstrap_dgr,
+    bootstrap_main,
+    bootstrap_trading,
+)
+from .iceberg_io import (
+    ABN_DGR_HISTORY_SCHEMA,
+    ABN_MAIN_HISTORY_SCHEMA,
+    ABN_TRADING_HISTORY_SCHEMA,
+    connect_r2_catalog,
+    ensure_history_tables,
+    load_iceberg_settings_from_env,
+    update_history_table,
+)
 from .parse import parse_records
 from .publish import (
     R2Settings,
@@ -38,8 +55,13 @@ def main() -> None:
     is_flag=True,
     help="Build artefacts locally without uploading to R2.",
 )
+@click.option(
+    "--skip-iceberg",
+    is_flag=True,
+    help="Skip the Iceberg history step (still publishes snapshot parquets).",
+)
 @click.option("--force", is_flag=True, help="Run even if the source extract is unchanged.")
-def run(output_dir: str, skip_publish: bool, force: bool) -> None:
+def run(output_dir: str, skip_publish: bool, skip_iceberg: bool, force: bool) -> None:
     """Run the full pipeline: fetch -> download -> parse -> write -> publish."""
     work_dir = Path(output_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -87,6 +109,14 @@ def run(output_dir: str, skip_publish: bool, force: bool) -> None:
         f"  rows: main={counts.main:,} trading={counts.trading:,} dgr={counts.dgr:,}"
     )
 
+    iceberg_summary: dict | None = None
+    if not skip_publish and not skip_iceberg:
+        iceberg_summary = _run_iceberg_step(
+            paths,
+            extract_date_iso=extract_date,
+        )
+        click.echo(f"Iceberg history step: {iceberg_summary}")
+
     manifest = build_manifest(
         paths,
         counts,
@@ -94,6 +124,8 @@ def run(output_dir: str, skip_publish: bool, force: bool) -> None:
         pipeline_run_id=str(uuid.uuid4()),
         generated_at=started.isoformat().replace("+00:00", "Z"),
     )
+    if iceberg_summary is not None:
+        manifest["iceberg"] = iceberg_summary
     manifest_path = work_dir / "manifest.json"
     write_manifest(manifest, manifest_path)
     click.echo(f"Manifest: {manifest_path}")
@@ -107,6 +139,57 @@ def run(output_dir: str, skip_publish: bool, force: bool) -> None:
     plans = plan_uploads(work_dir, extract_date=extract_date)
     upload_all(s3, settings.bucket, plans)
     click.echo(f"Uploaded {len(plans)} files (each as -latest and -{extract_date}).")
+
+
+def _run_iceberg_step(paths: WriterPaths, *, extract_date_iso: str) -> dict:
+    """Apply SCD2 update to the three Iceberg history tables on R2 Data Catalog.
+
+    Reads each just-written snapshot parquet, reconciles against the prior
+    history (or bootstraps if the table is empty), writes back. Returns a
+    summary dict per relation for the manifest.
+    """
+    import polars as pl
+
+    extract_date = date.fromisoformat(extract_date_iso)
+
+    iceberg_settings = load_iceberg_settings_from_env()
+    catalog = connect_r2_catalog(iceberg_settings)
+    tables = ensure_history_tables(catalog, namespace=iceberg_settings.namespace)
+
+    summary: dict = {}
+    for table_key, parquet_path, schema, bootstrap_fn, apply_fn in (
+        (
+            "abn_main_history",
+            paths.main_parquet,
+            ABN_MAIN_HISTORY_SCHEMA,
+            bootstrap_main,
+            apply_update_main,
+        ),
+        (
+            "abn_trading_names_history",
+            paths.trading_parquet,
+            ABN_TRADING_HISTORY_SCHEMA,
+            bootstrap_trading,
+            apply_update_trading,
+        ),
+        (
+            "abn_dgr_history",
+            paths.dgr_parquet,
+            ABN_DGR_HISTORY_SCHEMA,
+            bootstrap_dgr,
+            apply_update_dgr,
+        ),
+    ):
+        snapshot_df = pl.read_parquet(parquet_path)
+        summary[table_key] = update_history_table(
+            tables[table_key],
+            snapshot_df,
+            extract_date,
+            bootstrap_fn=bootstrap_fn,
+            apply_fn=apply_fn,
+            schema=schema,
+        )
+    return summary
 
 
 def _load_r2_settings() -> R2Settings:
