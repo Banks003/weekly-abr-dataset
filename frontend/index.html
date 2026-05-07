@@ -477,6 +477,11 @@
   let MAIN_SOURCE = '';
   let TRADING_SOURCE = '';
   let DGR_SOURCE = '';
+  // The compact search-index Parquet, built by the pipeline. One row per
+  // ABN with a pre-lowercased ``search_text`` field that concatenates
+  // every name a user might search by. Avoids an ILIKE OR'd across four
+  // columns + a trading-names sub-query on every keystroke.
+  let SEARCH_SOURCE = '';
   // SCD2 filter applied to every read of the history tables so only the
   // currently-valid row per ABN is visible to the UI.
   const CURRENT = 'valid_to IS NULL';
@@ -526,6 +531,12 @@
       MAIN_SOURCE = parquetSource(snap.tables.abn_main_history.data_files);
       TRADING_SOURCE = parquetSource(snap.tables.abn_trading_names_history.data_files);
       DGR_SOURCE = parquetSource(snap.tables.abn_dgr_history.data_files);
+      // search_index_url is published alongside the iceberg-snapshot
+      // manifest by the pipeline; falls back to the well-known path if
+      // the manifest is from an older pipeline run that doesn't include it.
+      const searchUrl = snap.search_index_url
+        || `${DATA_BASE}/abn-search-latest.parquet`;
+      SEARCH_SOURCE = `read_parquet('${searchUrl}')`;
       manifestRowCount = snap.tables.abn_main_history.row_count ?? null;
       $('edition-date').textContent = formatEditionDate(snap.extract_time);
       if (snap.extract_time) {
@@ -563,22 +574,16 @@
     const filters = [];
     const params = [];
 
-    // SCD2 filter is implicit on the main relation (added at the call site
-    // in countRows / fetchPage), but the trading-names sub-query also needs
-    // it so we don't surface trading-name hits from previous snapshots.
+    // All filtering — text and structured — happens against the slim
+    // search index. ABN lookup uses an exact match; substring search hits
+    // a single ILIKE on the pre-lowercased search_text column.
     if (q) {
       if (/^\d{11}$/.test(q.replace(/\s/g, ''))) {
         filters.push('abn = ?');
         params.push(q.replace(/\s/g, ''));
       } else {
-        const pat = `%${q}%`;
-        filters.push(`(
-          main_name ILIKE ?
-          OR individual_family_name ILIKE ?
-          OR individual_given_names ILIKE ?
-          OR abn IN (SELECT abn FROM ${TRADING_SOURCE} WHERE ${CURRENT} AND name ILIKE ?)
-        )`);
-        params.push(pat, pat, pat, pat);
+        filters.push('search_text ILIKE ?');
+        params.push(`%${q.toLowerCase()}%`);
       }
     }
     if (state) { filters.push('state = ?'); params.push(state); }
@@ -588,8 +593,8 @@
   }
 
   async function countRows({ where, params }) {
-    const wherePlus = where ? `${where} AND ${CURRENT}` : `WHERE ${CURRENT}`;
-    const stmt = await conn.prepare(`SELECT COUNT(*) AS n FROM ${MAIN_SOURCE} ${wherePlus}`);
+    // Filter count comes from the search index — one row per ABN.
+    const stmt = await conn.prepare(`SELECT COUNT(*) AS n FROM ${SEARCH_SOURCE} ${where}`);
     const result = await stmt.query(...params);
     await stmt.close();
     return Number(result.toArray()[0].toJSON().n);
@@ -597,14 +602,15 @@
 
   async function fetchPage({ where, params }, offset, limit, filtered) {
     const orderBy = filtered ? 'ORDER BY abn' : '';
-    const wherePlus = where ? `${where} AND ${CURRENT}` : `WHERE ${CURRENT}`;
+    // Display row comes entirely from the search index. ``name`` is the
+    // pre-computed display name (main_name for entities, individual full
+    // name for legal entities); we keep raw individual_* fields out of
+    // the table render so we don't need a join back to abn_main_history.
     const sql = `
-      SELECT abn, main_name, individual_title, individual_given_names,
-             individual_family_name, entity_kind, entity_type_ind,
-             entity_type_text, state, postcode, abn_status,
-             gst_status, asic_number
-      FROM ${MAIN_SOURCE}
-      ${wherePlus}
+      SELECT abn, name, entity_kind, entity_type_ind, entity_type_text,
+             state, postcode, abn_status, gst_status, asic_number
+      FROM ${SEARCH_SOURCE}
+      ${where}
       ${orderBy}
       LIMIT ? OFFSET ?
     `;
@@ -625,11 +631,9 @@
   }
 
   function nameFor(row) {
-    if (row.entity_kind === 'legal') {
-      return [row.individual_title, row.individual_given_names, row.individual_family_name]
-        .filter(Boolean).join(' ');
-    }
-    return row.main_name ?? '—';
+    // The search index pre-computes the display name for both kinds
+    // (main_name for entities, individual full name for legal entities).
+    return row.name ?? '—';
   }
 
   function escapeHtml(s) {

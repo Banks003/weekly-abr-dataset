@@ -38,6 +38,7 @@ from .publish import (
     read_remote_manifest,
     upload_all,
 )
+from .search_index import build_search_index
 from .write import WriterBundle, WriterPaths, build_manifest, write_manifest
 
 
@@ -139,6 +140,13 @@ def run(
         f"  rows: main={counts.main:,} trading={counts.trading:,} dgr={counts.dgr:,}"
     )
 
+    click.echo("Building search index for the frontend filter...")
+    search_index_path = work_dir / "abn-search.parquet"
+    search_rows = build_search_index(
+        paths.main_parquet, paths.trading_parquet, search_index_path
+    )
+    click.echo(f"  search index: {search_rows:,} rows -> {search_index_path}")
+
     iceberg_summary: dict | None = None
     iceberg_ns = "abr_test" if truncated else "abr"
     if not skip_iceberg:
@@ -185,6 +193,9 @@ def run(
         manifest["iceberg_namespace"] = iceberg_ns
     if iceberg_snapshot_manifest is not None:
         manifest["iceberg_snapshot_url"] = f"{public_base_url_for(settings)}/iceberg-snapshot.json"
+        iceberg_snapshot_manifest["search_index_url"] = (
+            f"{public_base_url_for(settings)}/abn-search-latest.parquet"
+        )
     if truncated:
         manifest["truncated"] = True
         manifest["max_records"] = max_records
@@ -201,6 +212,25 @@ def run(
     click.echo(f"Uploading to R2 bucket '{settings.bucket}'...")
     plans = plan_uploads(work_dir, extract_date=extract_date)
     upload_all(s3, settings.bucket, plans)
+    # Search index — uploaded as -latest and a dated copy alongside
+    # the manifest. Keeps the same versioning convention.
+    if search_index_path.exists():
+        with search_index_path.open("rb") as f:
+            search_body = f.read()
+        for key in (
+            "abn-search-latest.parquet",
+            f"abn-search-{extract_date}.parquet",
+        ):
+            s3.put_object(
+                Bucket=settings.bucket,
+                Key=key,
+                Body=search_body,
+                ContentType="application/vnd.apache.parquet",
+            )
+        click.echo(
+            f"Uploaded search index ({len(search_body):,} bytes) to "
+            f"{public_base_url_for(settings)}/abn-search-latest.parquet"
+        )
     if iceberg_snapshot_manifest is not None:
         snap_body = json.dumps(
             iceberg_snapshot_manifest, indent=2, sort_keys=True
