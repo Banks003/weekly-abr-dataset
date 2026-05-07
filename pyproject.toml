@@ -14,6 +14,7 @@ dependencies = [
     "click>=8.1.0",
     "boto3>=1.35.0",
     "tqdm>=4.66.0",
+    "pyiceberg[pyarrow,sql-sqlite]>=0.7",
 ]
 
 [project.scripts]
