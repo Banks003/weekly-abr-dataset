@@ -23,6 +23,7 @@ from .iceberg_io import (
     ABN_DGR_HISTORY_SCHEMA,
     ABN_MAIN_HISTORY_SCHEMA,
     ABN_TRADING_HISTORY_SCHEMA,
+    bootstrap_history_table_arrow,
     build_snapshot_manifest,
     connect_r2_catalog,
     ensure_history_tables,
@@ -311,11 +312,15 @@ def _run_iceberg_step(
 ) -> dict:
     """Apply SCD2 update to the three Iceberg history tables on R2 Data Catalog.
 
-    Reads each just-written snapshot parquet, reconciles against the prior
-    history (or bootstraps if the table is empty), writes back. Returns a
-    summary dict per relation for the manifest.
+    For empty tables (bootstrap case — first run on a namespace) we use the
+    streaming pyarrow fast path which avoids materialising the whole
+    snapshot in Polars. For tables with existing history we fall back to
+    the polars-driven SCD2 reconciliation since the joins are expressed
+    against polars DataFrames.
+
+    Returns a summary dict per relation for the manifest.
     """
-    import polars as pl
+    import gc
 
     extract_date = date.fromisoformat(extract_date_iso)
 
@@ -324,13 +329,14 @@ def _run_iceberg_step(
     tables = ensure_history_tables(catalog, namespace=namespace)
 
     summary: dict = {}
-    for table_key, parquet_path, schema, bootstrap_fn, apply_fn in (
+    for table_key, parquet_path, schema, bootstrap_fn, apply_fn, src_record_col in (
         (
             "abn_main_history",
             paths.main_parquet,
             ABN_MAIN_HISTORY_SCHEMA,
             bootstrap_main,
             apply_update_main,
+            "record_last_updated",
         ),
         (
             "abn_trading_names_history",
@@ -338,6 +344,7 @@ def _run_iceberg_step(
             ABN_TRADING_HISTORY_SCHEMA,
             bootstrap_trading,
             apply_update_trading,
+            None,
         ),
         (
             "abn_dgr_history",
@@ -345,24 +352,36 @@ def _run_iceberg_step(
             ABN_DGR_HISTORY_SCHEMA,
             bootstrap_dgr,
             apply_update_dgr,
+            None,
         ),
     ):
-        snapshot_df = pl.read_parquet(parquet_path)
-        summary[table_key] = update_history_table(
-            tables[table_key],
-            snapshot_df,
-            extract_date,
-            bootstrap_fn=bootstrap_fn,
-            apply_fn=apply_fn,
-            schema=schema,
-        )
-        # Drop the snapshot DataFrame eagerly between tables. Iceberg's
-        # history reconciliation peaks on memory; without this Python's
-        # GC may keep the previous snapshot live across tables and we OOM
-        # on the runner.
-        del snapshot_df
-        import gc as _gc
-        _gc.collect()
+        ice_table = tables[table_key]
+        ice_table.refresh()
+        # Cheap probe: does the iceberg table already have a snapshot?
+        # current_snapshot() returns None on empty tables (no rows ever
+        # written). If empty, take the arrow fast path.
+        is_empty = ice_table.current_snapshot() is None
+
+        if is_empty:
+            summary[table_key] = bootstrap_history_table_arrow(
+                ice_table,
+                parquet_path,
+                extract_date,
+                record_last_updated_column=src_record_col,
+            )
+        else:
+            import polars as pl
+            snapshot_df = pl.read_parquet(parquet_path)
+            summary[table_key] = update_history_table(
+                ice_table,
+                snapshot_df,
+                extract_date,
+                bootstrap_fn=bootstrap_fn,
+                apply_fn=apply_fn,
+                schema=schema,
+            )
+            del snapshot_df
+        gc.collect()
     return summary
 
 
