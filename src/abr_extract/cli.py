@@ -244,8 +244,18 @@ def download(output_dir: str) -> None:
     default=None,
     help="Override the dataset URL or path (default: live R2)",
 )
+@click.option(
+    "--cache-dir",
+    default=None,
+    help="Local directory to cache downloaded parquets (faster repeat queries)",
+)
 def search_cmd(
-    query: str, limit: int, search_in: str, output_format: str, source: str | None
+    query: str,
+    limit: int,
+    search_in: str,
+    output_format: str,
+    source: str | None,
+    cache_dir: str | None,
 ) -> None:
     """Search for ABNs by name (main, trading or individual)."""
     import json as _json
@@ -253,7 +263,13 @@ def search_cmd(
     from .query import DEFAULT_SOURCE
     from .query import search as _search
 
-    rows = _search(query, limit=limit, search_in=search_in, source=source or DEFAULT_SOURCE)
+    rows = _search(
+        query,
+        limit=limit,
+        search_in=search_in,
+        source=source or DEFAULT_SOURCE,
+        cache_dir=cache_dir,
+    )
     if output_format == "json":
         click.echo(_json.dumps(rows, indent=2, default=str))
         return
@@ -278,13 +294,22 @@ def search_cmd(
 )
 @click.option("--source", default=None, help="Override the dataset URL or path")
 @click.option(
+    "--cache-dir",
+    default=None,
+    help="Local directory to cache downloaded parquets (faster repeat queries)",
+)
+@click.option(
     "--enrich-live",
     is_flag=True,
     help="Also call the official ABR JSON API for fields not in the bulk extract "
     "(needs ABR_API_GUID env var)",
 )
 def profile_cmd(
-    abn: str, output_format: str, source: str | None, enrich_live: bool
+    abn: str,
+    output_format: str,
+    source: str | None,
+    cache_dir: str | None,
+    enrich_live: bool,
 ) -> None:
     """Fetch the full profile for one ABN."""
     import json as _json
@@ -293,7 +318,7 @@ def profile_cmd(
     from .query import enrich_profile_live as _enrich
     from .query import profile as _profile
 
-    p = _profile(abn, source=source or DEFAULT_SOURCE)
+    p = _profile(abn, source=source or DEFAULT_SOURCE, cache_dir=cache_dir)
     if p is None:
         raise click.ClickException(f"ABN {abn} not found")
     if enrich_live:
@@ -351,8 +376,18 @@ def profile_cmd(
     default="table",
 )
 @click.option("--source", default=None, help="Override the dataset URL or path")
+@click.option(
+    "--cache-dir",
+    default=None,
+    help="Local directory to cache downloaded parquets (faster repeat queries)",
+)
 def trends_cmd(
-    metric: str, since: str, group_by: str, output_format: str, source: str | None
+    metric: str,
+    since: str,
+    group_by: str,
+    output_format: str,
+    source: str | None,
+    cache_dir: str | None,
 ) -> None:
     """Pre-baked aggregations: registrations, cancellations, by_state, by_entity_type."""
     import csv as _csv
@@ -362,7 +397,13 @@ def trends_cmd(
     from .query import DEFAULT_SOURCE
     from .query import trends as _trends
 
-    rows = _trends(metric, since=since, group_by=group_by, source=source or DEFAULT_SOURCE)
+    rows = _trends(
+        metric,
+        since=since,
+        group_by=group_by,
+        source=source or DEFAULT_SOURCE,
+        cache_dir=cache_dir,
+    )
     if output_format == "json":
         click.echo(_json.dumps(rows, indent=2, default=str))
         return

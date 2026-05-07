@@ -17,6 +17,7 @@ effective-from/to dates, GST to-date). Needs an ABR_API_GUID.
 from __future__ import annotations
 
 import json as _json
+from pathlib import Path
 from typing import Any
 
 import duckdb
@@ -25,15 +26,47 @@ import httpx
 DEFAULT_SOURCE = "https://gazetteer.au"
 ABR_JSON_URL = "https://abr.business.gov.au/json/AbnDetails.aspx"
 
+PARQUET_FILES = {
+    "main": "abn-main-latest.parquet",
+    "trading": "abn-trading-names-latest.parquet",
+    "dgr": "abn-dgr-latest.parquet",
+}
 
-def _resolve_paths(source: str) -> dict[str, str]:
-    """source can be an HTTPS base URL or a local directory."""
+
+def _resolve_paths(source: str, cache_dir: str | Path | None = None) -> dict[str, str]:
+    """source: HTTPS base URL or a local directory containing the parquets.
+
+    If cache_dir is given, files are downloaded once into it (if missing) and
+    queries hit the local paths. Subsequent calls reuse the cached files.
+    """
     base = source.rstrip("/")
-    return {
-        "main": f"{base}/abn-main-latest.parquet",
-        "trading": f"{base}/abn-trading-names-latest.parquet",
-        "dgr": f"{base}/abn-dgr-latest.parquet",
-    }
+    if cache_dir is None:
+        return {key: f"{base}/{name}" for key, name in PARQUET_FILES.items()}
+
+    cache = Path(cache_dir)
+    cache.mkdir(parents=True, exist_ok=True)
+    resolved: dict[str, str] = {}
+    for key, name in PARQUET_FILES.items():
+        local = cache / name
+        if not local.exists() or local.stat().st_size == 0:
+            _download_into(f"{base}/{name}", local)
+        resolved[key] = str(local)
+    return resolved
+
+
+def _download_into(url: str, dest: Path) -> None:
+    """Stream a remote file into dest atomically (.part rename on success)."""
+    part = dest.with_suffix(dest.suffix + ".part")
+    timeout = httpx.Timeout(30.0, read=300.0)
+    with (
+        httpx.Client(timeout=timeout, follow_redirects=True) as client,
+        client.stream("GET", url) as resp,
+    ):
+        resp.raise_for_status()
+        with part.open("wb") as f:
+            for chunk in resp.iter_bytes(1 << 20):
+                f.write(chunk)
+    part.replace(dest)
 
 
 def _connect(source: str) -> duckdb.DuckDBPyConnection:
@@ -49,14 +82,15 @@ def search(
     limit: int = 20,
     search_in: str = "all",
     source: str = DEFAULT_SOURCE,
+    cache_dir: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     """Search for ABNs by name.
 
     search_in: "main" (main_name only), "trading" (trading names),
                "individual" (sole-trader names), or "all" (all three).
     """
-    paths = _resolve_paths(source)
-    con = _connect(source)
+    paths = _resolve_paths(source, cache_dir)
+    con = _connect("file" if cache_dir else source)
     pattern = f"%{query}%"
 
     parts: list[str] = []
@@ -112,10 +146,15 @@ def search(
     return rows
 
 
-def profile(abn: str, *, source: str = DEFAULT_SOURCE) -> dict[str, Any] | None:
+def profile(
+    abn: str,
+    *,
+    source: str = DEFAULT_SOURCE,
+    cache_dir: str | Path | None = None,
+) -> dict[str, Any] | None:
     """Full nested profile for one ABN. Returns None if not found."""
-    paths = _resolve_paths(source)
-    con = _connect(source)
+    paths = _resolve_paths(source, cache_dir)
+    con = _connect("file" if cache_dir else source)
 
     main_rows = (
         con.execute(
@@ -177,6 +216,7 @@ def trends(
     since: str = "2020-01-01",
     group_by: str = "month",
     source: str = DEFAULT_SOURCE,
+    cache_dir: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     """Pre-baked aggregations.
 
@@ -186,8 +226,8 @@ def trends(
       - by_state:        active ABN counts by state (no time grouping)
       - by_entity_type:  active ABN counts by entity type (no time grouping)
     """
-    paths = _resolve_paths(source)
-    con = _connect(source)
+    paths = _resolve_paths(source, cache_dir)
+    con = _connect("file" if cache_dir else source)
 
     if metric in ("registrations", "cancellations"):
         date_format = "%Y-%m" if group_by == "month" else "%Y"
