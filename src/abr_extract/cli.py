@@ -165,13 +165,24 @@ def run(
         merge_shards_to_parquet(
             [r.paths.dgr for r in shard_results], paths.dgr_parquet, ABN_DGR_SCHEMA
         )
+        # Free the intermediate per-worker shards (~1.4GB) so the Iceberg
+        # step has clean disk + page-cache headroom.
+        import contextlib as _ctx
+        import shutil as _shutil
+        with _ctx.suppress(Exception):
+            _shutil.rmtree(shard_dir, ignore_errors=True)
 
-        click.echo("Materialising SQLite from merged Parquet...")
-        counts = build_sqlite_from_parquet(
-            paths.main_parquet,
-            paths.trading_parquet,
-            paths.dgr_parquet,
-            paths.sqlite_db,
+        # NOTE: SQLite materialisation moved to the post-Iceberg block
+        # below. Iceberg history loads the full prior snapshot into Polars
+        # memory and the SQLite mirror was eating ~4GB of OS page cache
+        # going in, leading to runner cancellation under memory pressure.
+        from pyarrow.parquet import read_metadata as _pq_meta
+
+        from .write import WriteCounts as _WriteCounts
+        counts = _WriteCounts(
+            main=_pq_meta(paths.main_parquet).num_rows,
+            trading=_pq_meta(paths.trading_parquet).num_rows,
+            dgr=_pq_meta(paths.dgr_parquet).num_rows,
         )
     else:
         click.echo("Parsing and writing artefacts (single-process)...")
@@ -208,6 +219,19 @@ def run(
             namespace=iceberg_ns,
         )
         click.echo(f"Iceberg history step ({iceberg_ns}): {iceberg_summary}")
+
+    # Build SQLite after Iceberg so the heavy iceberg history reconciliation
+    # gets clean memory headroom. We populate counts via parquet metadata
+    # earlier (no full read), so we don't need WriterBundle to have written
+    # SQLite to know the row counts.
+    if use_parallel:
+        click.echo("Materialising SQLite from merged Parquet (post-Iceberg)...")
+        build_sqlite_from_parquet(
+            paths.main_parquet,
+            paths.trading_parquet,
+            paths.dgr_parquet,
+            paths.sqlite_db,
+        )
 
     iceberg_snapshot_manifest: dict | None = None
     if not skip_iceberg:
@@ -332,6 +356,13 @@ def _run_iceberg_step(
             apply_fn=apply_fn,
             schema=schema,
         )
+        # Drop the snapshot DataFrame eagerly between tables. Iceberg's
+        # history reconciliation peaks on memory; without this Python's
+        # GC may keep the previous snapshot live across tables and we OOM
+        # on the runner.
+        del snapshot_df
+        import gc as _gc
+        _gc.collect()
     return summary
 
 
