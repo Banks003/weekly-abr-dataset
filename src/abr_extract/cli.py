@@ -224,6 +224,167 @@ def download(output_dir: str) -> None:
         )
 
 
+@main.command(name="search")
+@click.argument("query")
+@click.option("--limit", default=20, help="Max results")
+@click.option(
+    "--in",
+    "search_in",
+    type=click.Choice(["all", "main", "trading", "individual"]),
+    default="all",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["json", "table"]),
+    default="table",
+)
+@click.option(
+    "--source",
+    default=None,
+    help="Override the dataset URL or path (default: live R2)",
+)
+def search_cmd(
+    query: str, limit: int, search_in: str, output_format: str, source: str | None
+) -> None:
+    """Search for ABNs by name (main, trading or individual)."""
+    import json as _json
+
+    from .query import DEFAULT_SOURCE
+    from .query import search as _search
+
+    rows = _search(query, limit=limit, search_in=search_in, source=source or DEFAULT_SOURCE)
+    if output_format == "json":
+        click.echo(_json.dumps(rows, indent=2, default=str))
+        return
+    if not rows:
+        click.echo("(no matches)")
+        return
+    cols = list(rows[0].keys())
+    click.echo("  " + " | ".join(cols))
+    click.echo("  " + "-+-".join("-" * len(c) for c in cols))
+    for r in rows:
+        cells = [str(r[c]) if r[c] is not None else "" for c in cols]
+        click.echo("  " + " | ".join(cells))
+
+
+@main.command(name="profile")
+@click.argument("abn")
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["json", "table"]),
+    default="json",
+)
+@click.option("--source", default=None, help="Override the dataset URL or path")
+@click.option(
+    "--enrich-live",
+    is_flag=True,
+    help="Also call the official ABR JSON API for fields not in the bulk extract "
+    "(needs ABR_API_GUID env var)",
+)
+def profile_cmd(
+    abn: str, output_format: str, source: str | None, enrich_live: bool
+) -> None:
+    """Fetch the full profile for one ABN."""
+    import json as _json
+
+    from .query import DEFAULT_SOURCE
+    from .query import enrich_profile_live as _enrich
+    from .query import profile as _profile
+
+    p = _profile(abn, source=source or DEFAULT_SOURCE)
+    if p is None:
+        raise click.ClickException(f"ABN {abn} not found")
+    if enrich_live:
+        guid = os.environ.get("ABR_API_GUID")
+        if not guid:
+            raise click.ClickException(
+                "ABR_API_GUID env var is required for --enrich-live"
+            )
+        p["live"] = _enrich(abn, guid=guid)
+    if output_format == "json":
+        click.echo(_json.dumps(p, indent=2, default=str))
+        return
+    click.echo(f"ABN:                  {p['abn']}")
+    click.echo(f"Main name:            {p['main_name']}")
+    if p["individual"]:
+        i = p["individual"]
+        full = " ".join(
+            [s for s in (i.get("title"), i.get("given_names"), i.get("family_name")) if s]
+        )
+        click.echo(f"Individual:           {full}")
+    click.echo(f"Entity type:          {p['entity_type']['text']} ({p['entity_type']['code']})")
+    state = p["address"]["state"] or "-"
+    postcode = p["address"]["postcode"] or "-"
+    click.echo(f"Address:              {state} {postcode}")
+    click.echo(f"ABN status:           {p['abn_status']['status']} from {p['abn_status']['from']}")
+    if p["gst"]:
+        click.echo(f"GST:                  {p['gst']['status']} from {p['gst']['from']}")
+    click.echo(f"\nTrading / business names ({len(p['trading_names'])}):")
+    for t in p["trading_names"]:
+        click.echo(f"  [{t['type']}] {t['name']}")
+    click.echo(f"\nDGR registrations ({len(p['dgrs'])}):")
+    for d in p["dgrs"]:
+        name = d["name"] or "(applies to main entity)"
+        click.echo(f"  {d['from']}  [{d['status'] or '—'}]  {name}")
+
+
+@main.command(name="trends")
+@click.argument(
+    "metric",
+    type=click.Choice(
+        ["registrations", "cancellations", "by_state", "by_entity_type"]
+    ),
+)
+@click.option("--since", default="2020-01-01", help="Lower bound on dates (ISO)")
+@click.option(
+    "--by",
+    "group_by",
+    type=click.Choice(["month", "year"]),
+    default="month",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["json", "csv", "table"]),
+    default="table",
+)
+@click.option("--source", default=None, help="Override the dataset URL or path")
+def trends_cmd(
+    metric: str, since: str, group_by: str, output_format: str, source: str | None
+) -> None:
+    """Pre-baked aggregations: registrations, cancellations, by_state, by_entity_type."""
+    import csv as _csv
+    import io as _io
+    import json as _json
+
+    from .query import DEFAULT_SOURCE
+    from .query import trends as _trends
+
+    rows = _trends(metric, since=since, group_by=group_by, source=source or DEFAULT_SOURCE)
+    if output_format == "json":
+        click.echo(_json.dumps(rows, indent=2, default=str))
+        return
+    if output_format == "csv":
+        buf = _io.StringIO()
+        if rows:
+            writer = _csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        click.echo(buf.getvalue().rstrip())
+        return
+    if not rows:
+        click.echo("(no rows)")
+        return
+    cols = list(rows[0].keys())
+    click.echo("  " + " | ".join(cols))
+    click.echo("  " + "-+-".join("-" * len(c) for c in cols))
+    for r in rows:
+        cells = [str(r[c]) if r[c] is not None else "" for c in cols]
+        click.echo("  " + " | ".join(cells))
+
+
 @main.command()
 def check() -> None:
     """Print the current ABR bulk-extract catalog metadata."""
