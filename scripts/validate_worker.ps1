@@ -36,9 +36,16 @@ try {
     }
 
     # 2. Start wrangler dev in the background. Pipe output to a log file.
+    # npx on Windows is npx.cmd; Start-Process needs a real .exe or .cmd path.
+    $npxCmd = (Get-Command npx.cmd -ErrorAction SilentlyContinue).Source
+    if (-not $npxCmd) { $npxCmd = (Get-Command npx -ErrorAction SilentlyContinue).Source }
+    if (-not $npxCmd) {
+        Write-Error "Could not find npx on PATH. Is Node.js installed?"
+        exit 1
+    }
     $logFile = Join-Path $env:TEMP "wrangler-dev-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
-    Write-Host "==> Starting wrangler dev (log: $logFile)..." -ForegroundColor Cyan
-    $wranglerProcess = Start-Process -FilePath "npx" `
+    Write-Host "==> Starting wrangler dev via $npxCmd (log: $logFile)..." -ForegroundColor Cyan
+    $wranglerProcess = Start-Process -FilePath $npxCmd `
         -ArgumentList "wrangler", "dev", "--port", "8787" `
         -WorkingDirectory $workerDir `
         -RedirectStandardOutput $logFile `
