@@ -167,7 +167,7 @@ def test_batched_writes_match_unbatched(tmp_path: Path):
     assert df_a.equals(df_b)
 
 
-def test_manifest_includes_sha256_and_row_counts(tmp_path: Path):
+def test_manifest_has_run_metadata_and_row_counts(tmp_path: Path):
     paths = _run(tmp_path)
     manifest = build_manifest(
         paths,
@@ -179,14 +179,11 @@ def test_manifest_includes_sha256_and_row_counts(tmp_path: Path):
     write_manifest(manifest, tmp_path / "manifest.json")
     written = json.loads((tmp_path / "manifest.json").read_text())
     assert written["pipeline_run_id"] == "run-test"
+    assert written["generated_at"] == "2026-05-07T00:00:00Z"
     assert written["extract_time"] == "2026-05-06T12:23:33"
     assert written["row_counts"]["abn_main"] == 9
-    file_labels = {f["label"] for f in written["files"]}
-    expected = {"abn_main_parquet", "abn_trading_names_parquet", "abn_dgr_parquet", "sqlite"}
-    assert expected == file_labels
-    for f in written["files"]:
-        assert len(f["sha256"]) == 64
-        assert f["size_bytes"] > 0
+    # Files array is gone — Iceberg owns the dataset; manifest is just metadata.
+    assert "files" not in written
 
 
 def counts_proxy(paths: WriterPaths):

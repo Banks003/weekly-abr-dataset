@@ -50,20 +50,23 @@ def test_plan_uploads_handles_missing_files(tmp_path: Path):
     assert plans == []
 
 
-def test_plan_uploads_includes_present_files(tmp_path: Path):
+def test_plan_uploads_emits_manifest_only(tmp_path: Path):
+    # Snapshot files are intentionally ignored — Iceberg owns the dataset.
     for name in ("abn_main.parquet", "abn_dgr.parquet", "abr.sqlite", "manifest.json"):
         (tmp_path / name).write_bytes(b"x")
     plans = plan_uploads(tmp_path, extract_date="2026-05-06")
     keys = {(p.latest_key, p.dated_key) for p in plans}
-    assert ("abn-main-latest.parquet", "abn-main-2026-05-06.parquet") in keys
-    assert ("abn-dgr-latest.parquet", "abn-dgr-2026-05-06.parquet") in keys
-    assert ("abr-extract-latest.sqlite", "abr-extract-2026-05-06.sqlite") in keys
-    assert ("manifest.json", "manifest-2026-05-06.json") in keys
+    assert keys == {("manifest.json", "manifest-2026-05-06.json")}
+
+
+def test_plan_uploads_emits_nothing_when_manifest_missing(tmp_path: Path):
+    (tmp_path / "abn_main.parquet").write_bytes(b"x")
+    plans = plan_uploads(tmp_path, extract_date="2026-05-06")
+    assert plans == []
 
 
 @mock_aws
-def test_upload_all_writes_both_dated_and_latest(tmp_path: Path, aws_env, settings):
-    (tmp_path / "abn_main.parquet").write_bytes(b"parquet-bytes")
+def test_upload_all_writes_manifest_in_two_keys(tmp_path: Path, aws_env, settings):
     (tmp_path / "manifest.json").write_text('{"extract_time": "2026-05-06T12:23:33"}')
 
     s3 = _setup_bucket()
@@ -72,24 +75,16 @@ def test_upload_all_writes_both_dated_and_latest(tmp_path: Path, aws_env, settin
 
     listing = s3.list_objects_v2(Bucket=settings.bucket)
     keys = {obj["Key"] for obj in listing["Contents"]}
-    assert "abn-main-latest.parquet" in keys
-    assert "abn-main-2026-05-06.parquet" in keys
-    assert "manifest.json" in keys
-    assert "manifest-2026-05-06.json" in keys
+    assert keys == {"manifest.json", "manifest-2026-05-06.json"}
 
 
 @mock_aws
-def test_upload_all_sets_content_types(tmp_path: Path, aws_env, settings):
-    (tmp_path / "abn_main.parquet").write_bytes(b"x")
+def test_upload_all_sets_manifest_content_type(tmp_path: Path, aws_env, settings):
     (tmp_path / "manifest.json").write_text("{}")
     s3 = _setup_bucket()
-
     plans = plan_uploads(tmp_path, extract_date="2026-05-06")
     upload_all(s3, settings.bucket, plans)
-
-    head_pq = s3.head_object(Bucket=settings.bucket, Key="abn-main-latest.parquet")
     head_json = s3.head_object(Bucket=settings.bucket, Key="manifest.json")
-    assert head_pq["ContentType"] == "application/vnd.apache.parquet"
     assert head_json["ContentType"] == "application/json"
 
 

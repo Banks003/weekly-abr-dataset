@@ -213,21 +213,13 @@ def build_manifest(
     pipeline_run_id: str,
     generated_at: str,
 ) -> dict:
-    files = []
-    for label, p in (
-        ("abn_main_parquet", paths.main_parquet),
-        ("abn_trading_names_parquet", paths.trading_parquet),
-        ("abn_dgr_parquet", paths.dgr_parquet),
-        ("sqlite", paths.sqlite_db),
-    ):
-        files.append(
-            {
-                "label": label,
-                "filename": p.name,
-                "size_bytes": p.stat().st_size,
-                "sha256": sha256_of(p),
-            }
-        )
+    """Build the manifest metadata.
+
+    Iceberg owns the data; the manifest no longer enumerates snapshot
+    files (none are uploaded). Row counts are kept since they're useful
+    operational telemetry. Iceberg-specific details are added to the
+    manifest by the caller once the Iceberg step has run.
+    """
     return {
         "pipeline_run_id": pipeline_run_id,
         "generated_at": generated_at,
@@ -237,7 +229,6 @@ def build_manifest(
             "abn_trading_names": counts.trading,
             "abn_dgr": counts.dgr,
         },
-        "files": files,
     }
 
 

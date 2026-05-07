@@ -64,28 +64,14 @@ def plan_uploads(
     *,
     extract_date: str,
 ) -> list[UploadPlan]:
-    """Build the list of files to upload from a work_dir produced by WriterBundle.
+    """Build the list of files to upload from a work_dir.
 
-    extract_date is the ISO date (YYYY-MM-DD) that names the archive copy.
+    Iceberg owns the dataset itself (via R2 Data Catalog), so we don't
+    upload snapshot Parquets or the SQLite mirror anymore. manifest.json
+    is the only thing uploaded — it's tiny, drives the freshness check,
+    and is served by the Worker's /manifest endpoint.
     """
-    plans = []
-    for local_name, stem in (
-        ("abn_main.parquet", "abn-main"),
-        ("abn_trading_names.parquet", "abn-trading-names"),
-        ("abn_dgr.parquet", "abn-dgr"),
-        ("abr.sqlite", "abr-extract"),
-    ):
-        local = work_dir / local_name
-        if not local.exists():
-            continue
-        ext = local.suffix
-        plans.append(
-            UploadPlan(
-                local_path=local,
-                latest_key=f"{stem}-latest{ext}",
-                dated_key=f"{stem}-{extract_date}{ext}",
-            )
-        )
+    plans: list[UploadPlan] = []
     manifest = work_dir / "manifest.json"
     if manifest.exists():
         plans.append(
