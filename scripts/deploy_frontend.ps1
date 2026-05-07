@@ -1,12 +1,19 @@
 # deploy_frontend.ps1 — upload frontend/index.html to the R2 bucket so it's
 # served at https://gazetteer.au/abns/index.html (and /abns/ if directory
-# index serving is enabled on the bucket).
+# index serving is enabled on the bucket). Also uploads robots.txt to the
+# bucket root so it's served at https://gazetteer.au/robots.txt — bots
+# are disallowed until we publish a proper MCP/API connection.
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $frontend = Join-Path $repoRoot "frontend\index.html"
+$robots   = Join-Path $repoRoot "frontend\robots.txt"
 if (-not (Test-Path $frontend)) {
     Write-Error "frontend/index.html not found"
+    exit 1
+}
+if (-not (Test-Path $robots)) {
+    Write-Error "frontend/robots.txt not found"
     exit 1
 }
 
@@ -17,7 +24,15 @@ npx wrangler r2 object put weekly-abr-dataset/abns/index.html `
     --remote
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+Write-Host "==> Uploading $robots to weekly-abr-dataset/robots.txt..." -ForegroundColor Cyan
+npx wrangler r2 object put weekly-abr-dataset/robots.txt `
+    --file=$robots `
+    --content-type="text/plain; charset=utf-8" `
+    --remote
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
 Write-Host ""
 Write-Host "Live at:" -ForegroundColor Green
 Write-Host "  https://gazetteer.au/abns/index.html"
 Write-Host "  https://gazetteer.au/abns/   (if R2 has directory-index enabled)"
+Write-Host "  https://gazetteer.au/robots.txt"

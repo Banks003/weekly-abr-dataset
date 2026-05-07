@@ -1,0 +1,8 @@
+# robots.txt for gazetteer.au
+#
+# Bots: please stay out for now.
+# Proper machine-readable connections (MCP, API) are coming soon —
+# you'll be able to query this data the right way without scraping.
+
+User-agent: *
+Disallow: /
