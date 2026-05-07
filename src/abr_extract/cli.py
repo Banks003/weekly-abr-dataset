@@ -29,7 +29,6 @@ from .iceberg_io import (
 )
 from .parallel import (
     DEFAULT_WORKERS,
-    build_sqlite_from_parquet,
     merge_shards_to_parquet,
     parse_zips_parallel,
 )
@@ -47,7 +46,14 @@ from .schema import (
     ABN_MAIN_SCHEMA,
     ABN_TRADING_NAMES_SCHEMA,
 )
-from .write import WriterBundle, WriterPaths, build_manifest, write_manifest
+from .write import (
+    WriteCounts,
+    WriterBundle,
+    WriterPaths,
+    build_manifest,
+    materialize_sqlite,
+    write_manifest,
+)
 
 
 @click.group()
@@ -152,25 +158,18 @@ def run(
         )
 
         click.echo("Merging per-worker shards into canonical Parquet outputs...")
-        merge_shards_to_parquet(
+        main_rows = merge_shards_to_parquet(
             [r.paths.main for r in shard_results], paths.main_parquet, ABN_MAIN_SCHEMA
         )
-        merge_shards_to_parquet(
+        trading_rows = merge_shards_to_parquet(
             [r.paths.trading for r in shard_results],
             paths.trading_parquet,
             ABN_TRADING_NAMES_SCHEMA,
         )
-        merge_shards_to_parquet(
+        dgr_rows = merge_shards_to_parquet(
             [r.paths.dgr for r in shard_results], paths.dgr_parquet, ABN_DGR_SCHEMA
         )
-
-        click.echo("Materialising SQLite from merged Parquet...")
-        counts = build_sqlite_from_parquet(
-            paths.main_parquet,
-            paths.trading_parquet,
-            paths.dgr_parquet,
-            paths.sqlite_db,
-        )
+        counts = WriteCounts(main=main_rows, trading=trading_rows, dgr=dgr_rows)
     else:
         click.echo("Parsing and writing artefacts (single-process)...")
         done_early = False
@@ -195,6 +194,14 @@ def run(
 
     click.echo(
         f"  rows: main={counts.main:,} trading={counts.trading:,} dgr={counts.dgr:,}"
+    )
+
+    click.echo("Materialising SQLite from merged Parquet via DuckDB sqlite_scanner...")
+    materialize_sqlite(
+        paths.main_parquet,
+        paths.trading_parquet,
+        paths.dgr_parquet,
+        paths.sqlite_db,
     )
 
     iceberg_summary: dict | None = None

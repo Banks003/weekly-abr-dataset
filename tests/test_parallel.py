@@ -1,11 +1,12 @@
 """Tests for the parallel parse pipeline (M6).
 
-We verify three things against the sequential WriterBundle reference:
+We verify two things against the sequential WriterBundle reference:
 1. Row counts match exactly across all three relations.
 2. After sort-by-ABN the merged Parquet content is identical (schema and
    values), per the issue's acceptance criteria.
-3. SQLite materialised from the merged Parquet has the same shape, indices
-   and unique-ABN main count as the sequential output.
+
+SQLite materialisation from the merged Parquet is covered separately in
+test_write.py via the M7 ``materialize_sqlite`` flow.
 
 The parallel module also exposes a single-process short-circuit
 (workers <= 1) which lets these tests run without spawning subprocesses,
@@ -14,7 +15,6 @@ avoiding fixture-pickling complications.
 
 from __future__ import annotations
 
-import sqlite3
 import zipfile
 from pathlib import Path
 
@@ -22,7 +22,6 @@ import pyarrow.parquet as pq
 import pytest
 
 from abr_extract.parallel import (
-    build_sqlite_from_parquet,
     merge_shards_to_parquet,
     parse_zips_parallel,
 )
@@ -150,74 +149,3 @@ def test_merge_shards_with_zero_inputs_still_writes_valid_parquet(tmp_path: Path
     assert rows == 0
     assert pq.read_table(dest).schema.equals(ABN_MAIN_SCHEMA, check_metadata=False)
     assert pq.read_table(dest).num_rows == 0
-
-
-def test_sqlite_built_from_parquet_matches_sequential_shape(
-    tmp_path: Path, sample_zips: list[Path]
-) -> None:
-    seq = _seq_paths(tmp_path / "seq")
-    _run_sequential(sample_zips, seq)
-
-    par_root = tmp_path / "par"
-    par_root.mkdir()
-    results = parse_zips_parallel(sample_zips, par_root / "shards", workers=1)
-
-    main_p = par_root / "abn_main.parquet"
-    trading_p = par_root / "abn_trading_names.parquet"
-    dgr_p = par_root / "abn_dgr.parquet"
-    sqlite_p = par_root / "abr.sqlite"
-
-    merge_shards_to_parquet([r.paths.main for r in results], main_p, ABN_MAIN_SCHEMA)
-    merge_shards_to_parquet(
-        [r.paths.trading for r in results], trading_p, ABN_TRADING_NAMES_SCHEMA
-    )
-    merge_shards_to_parquet([r.paths.dgr for r in results], dgr_p, ABN_DGR_SCHEMA)
-
-    counts = build_sqlite_from_parquet(main_p, trading_p, dgr_p, sqlite_p)
-
-    seq_conn = sqlite3.connect(seq.sqlite_db)
-    par_conn = sqlite3.connect(sqlite_p)
-    try:
-        # Same tables exist.
-        seq_tables = {row[0] for row in seq_conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        )}
-        par_tables = {row[0] for row in par_conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        )}
-        assert seq_tables == par_tables == {"abn_main", "abn_trading_names", "abn_dgr"}
-
-        # Same indices exist.
-        seq_indices = {row[0] for row in seq_conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'"
-        )}
-        par_indices = {row[0] for row in par_conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'"
-        )}
-        assert seq_indices == par_indices == {
-            "idx_trading_names_abn",
-            "idx_dgr_abn",
-            "idx_main_state",
-        }
-
-        # Main is keyed on ABN — count after dedup matches between paths.
-        seq_main_count = seq_conn.execute("SELECT COUNT(*) FROM abn_main").fetchone()[0]
-        par_main_count = par_conn.execute("SELECT COUNT(*) FROM abn_main").fetchone()[0]
-        assert seq_main_count == par_main_count
-
-        # Trading and DGR have no PK; total row counts must match.
-        for table in ("abn_trading_names", "abn_dgr"):
-            seq_n = seq_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            par_n = par_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            assert seq_n == par_n, (table, seq_n, par_n)
-    finally:
-        seq_conn.close()
-        par_conn.close()
-
-    # The returned WriteCounts reflect rows inserted (pre-PK-dedup for main).
-    par_main_rows = pq.read_table(main_p).num_rows
-    par_trading_rows = pq.read_table(trading_p).num_rows
-    par_dgr_rows = pq.read_table(dgr_p).num_rows
-    assert counts.main == par_main_rows
-    assert counts.trading == par_trading_rows
-    assert counts.dgr == par_dgr_rows

@@ -1,17 +1,23 @@
-"""Streaming writers for Parquet (per-table) and SQLite (one file, three tables).
+"""Streaming Parquet writer (per-table) and a DuckDB-driven SQLite materialiser.
 
-Writers accept RawRecord instances one at a time and flush in batches. The
-WriterBundle composes all four outputs so a single pass over the parser
-populates everything.
+WriterBundle is now Parquet-only: each call to ``write(record)`` appends to
+three streaming pyarrow ParquetWriters. The SQLite mirror is no longer
+written inline; it''s materialised as a separate post-parse step via
+:func:`materialize_sqlite`, which uses DuckDB''s ``sqlite_scanner`` extension
+to ``INSERT INTO ... SELECT * FROM read_parquet(...)`` at near-disk speed.
+
+Why the split: ``sqlite3.executemany`` over 20M rows in Python is slow
+(language-boundary overhead, single-threaded). DuckDB writes via the SQLite
+C API in batches with no per-row Python round-trip. The on-disk shape of
+the resulting database is identical: same three tables, same columns, same
+indices, dates as ISO ``YYYY-MM-DD`` strings.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
 from dataclasses import dataclass
-from datetime import date
 from pathlib import Path
 from types import TracebackType
 from typing import IO
@@ -29,12 +35,6 @@ from .schema import (
     record_to_main_row,
     record_to_trading_rows,
 )
-
-
-def _sqlite_value(value):
-    if isinstance(value, date):
-        return value.isoformat()
-    return value
 
 
 @dataclass
@@ -75,7 +75,12 @@ class _ParquetBatchWriter:
 
 
 class WriterBundle:
-    """Single-pass writer composing 3 Parquet files + a SQLite database."""
+    """Parquet-only streaming writer.
+
+    Composes the three per-table ParquetWriters so a single pass over the
+    parser populates all three relations. SQLite is no longer written
+    inline -- call :func:`materialize_sqlite` once at the end of the pipeline.
+    """
 
     def __init__(self, paths: WriterPaths, batch_size: int = 50_000):
         self.paths = paths
@@ -86,11 +91,6 @@ class WriterBundle:
         self._main_writer = _ParquetBatchWriter(paths.main_parquet, ABN_MAIN_SCHEMA)
         self._trading_writer = _ParquetBatchWriter(paths.trading_parquet, ABN_TRADING_NAMES_SCHEMA)
         self._dgr_writer = _ParquetBatchWriter(paths.dgr_parquet, ABN_DGR_SCHEMA)
-
-        self._sql_conn = sqlite3.connect(paths.sqlite_db)
-        for stmt in SQLITE_DDL:
-            self._sql_conn.execute(stmt)
-        self._sql_conn.commit()
 
         self._main_buffer: list[dict] = []
         self._trading_buffer: list[dict] = []
@@ -118,82 +118,126 @@ class WriterBundle:
     def _flush(self) -> None:
         if self._main_buffer:
             self._main_writer.write(self._main_buffer)
-            self._sql_conn.executemany(
-                _sqlite_main_insert(),
-                [_main_row_tuple(r) for r in self._main_buffer],
-            )
             self.counts.main += len(self._main_buffer)
             self._main_buffer.clear()
 
         if self._trading_buffer:
             self._trading_writer.write(self._trading_buffer)
-            self._sql_conn.executemany(
-                "INSERT INTO abn_trading_names (abn, name, name_type) VALUES (?, ?, ?)",
-                [(r["abn"], r["name"], r["name_type"]) for r in self._trading_buffer],
-            )
             self.counts.trading += len(self._trading_buffer)
             self._trading_buffer.clear()
 
         if self._dgr_buffer:
             self._dgr_writer.write(self._dgr_buffer)
-            self._sql_conn.executemany(
-                "INSERT INTO abn_dgr (abn, dgr_status_from_date, dgr_status, dgr_name) "
-                "VALUES (?, ?, ?, ?)",
-                [
-                    (
-                        r["abn"],
-                        _sqlite_value(r["dgr_status_from_date"]),
-                        r["dgr_status"],
-                        r["dgr_name"],
-                    )
-                    for r in self._dgr_buffer
-                ],
-            )
             self.counts.dgr += len(self._dgr_buffer)
             self._dgr_buffer.clear()
-
-        self._sql_conn.commit()
 
     def close(self) -> None:
         self._flush()
         self._main_writer.close()
         self._trading_writer.close()
         self._dgr_writer.close()
-        self._sql_conn.close()
 
 
-def _main_row_tuple(r: dict) -> tuple:
-    return (
-        r["abn"],
-        r["abn_status"],
-        _sqlite_value(r["abn_status_from_date"]),
-        _sqlite_value(r["record_last_updated"]),
-        r["replaced"],
-        r["entity_type_ind"],
-        r["entity_type_text"],
-        r["entity_kind"],
-        r["main_name"],
-        r["main_name_type"],
-        r["individual_title"],
-        r["individual_given_names"],
-        r["individual_family_name"],
-        r["individual_name_type"],
-        r["state"],
-        r["postcode"],
-        r["asic_number"],
-        r["asic_number_type"],
-        r["gst_status"],
-        _sqlite_value(r["gst_status_from_date"]),
-    )
+# SQLite materialisation -----------------------------------------------------
+
+# DuckDB selects with explicit casts for date columns so they land in
+# SQLite as ISO YYYY-MM-DD strings (SQLite has no native DATE type; the
+# rest of the codebase -- see query.py -- assumes dates are stored as text).
+_MAIN_SELECT = """
+SELECT
+    abn, abn_status,
+    CAST(abn_status_from_date AS VARCHAR) AS abn_status_from_date,
+    CAST(record_last_updated   AS VARCHAR) AS record_last_updated,
+    replaced, entity_type_ind, entity_type_text, entity_kind,
+    main_name, main_name_type,
+    individual_title, individual_given_names,
+    individual_family_name, individual_name_type,
+    state, postcode, asic_number, asic_number_type,
+    gst_status,
+    CAST(gst_status_from_date AS VARCHAR) AS gst_status_from_date
+FROM read_parquet(?)
+"""
+
+_TRADING_SELECT = """
+SELECT abn, name, name_type
+FROM read_parquet(?)
+"""
+
+_DGR_SELECT = """
+SELECT
+    abn,
+    CAST(dgr_status_from_date AS VARCHAR) AS dgr_status_from_date,
+    dgr_status, dgr_name
+FROM read_parquet(?)
+"""
 
 
-def _sqlite_main_insert() -> str:
-    cols = [name for name in ABN_MAIN_SCHEMA.names]
-    placeholders = ", ".join(["?"] * len(cols))
-    return f"INSERT OR REPLACE INTO abn_main ({', '.join(cols)}) VALUES ({placeholders})"
+def materialize_sqlite(
+    main_parquet: Path,
+    trading_parquet: Path,
+    dgr_parquet: Path,
+    sqlite_path: Path,
+) -> None:
+    """Build the canonical SQLite mirror from the merged Parquet outputs.
+
+    Strategy: pre-create the SQLite schema (DDL with PRIMARY KEY and
+    indices), then have DuckDB ``INSERT INTO ... SELECT * FROM
+    read_parquet(...)`` via the ``sqlite_scanner`` extension. DuckDB
+    does the heavy lifting in C, no per-row Python round-trip -- typically
+    > 10x faster than ``sqlite3.executemany`` over 20M rows.
+
+    DuckDB''s CTAS doesn''t preserve constraints, so we always create the
+    schema upfront and INSERT into it. That keeps the PRIMARY KEY on
+    ``abn_main.abn`` and the three secondary indices.
+
+    If ``sqlite_path`` already exists it''s truncated first so the build is
+    repeatable.
+    """
+    import sqlite3
+
+    import duckdb
+
+    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    if sqlite_path.exists():
+        sqlite_path.unlink()
+
+    # 1) Pre-create the schema with PK + indices.
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        for stmt in SQLITE_DDL:
+            conn.execute(stmt)
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 2) Bulk-insert from Parquet via DuckDB''s sqlite_scanner.
+    duck = duckdb.connect()
+    try:
+        duck.execute("INSTALL sqlite_scanner")
+        duck.execute("LOAD sqlite_scanner")
+        # ATTACH path is interpolated (no SQL placeholder support) -- sqlite_path
+        # comes from the pipeline, never from untrusted input.
+        duck.execute(f"ATTACH '{sqlite_path.as_posix()}' AS out (TYPE SQLITE)")
+
+        duck.execute(
+            f"INSERT INTO out.abn_main {_MAIN_SELECT}",
+            [str(main_parquet)],
+        )
+        duck.execute(
+            f"INSERT INTO out.abn_trading_names (abn, name, name_type) {_TRADING_SELECT}",
+            [str(trading_parquet)],
+        )
+        duck.execute(
+            f"INSERT INTO out.abn_dgr "
+            f"(abn, dgr_status_from_date, dgr_status, dgr_name) {_DGR_SELECT}",
+            [str(dgr_parquet)],
+        )
+    finally:
+        duck.close()
 
 
-# Manifest builder ---------------------------------------------------------
+# Manifest builder -----------------------------------------------------------
+
 
 def sha256_of(path: Path, chunk: int = 1 << 20) -> str:
     h = hashlib.sha256()
@@ -216,7 +260,7 @@ def build_manifest(
     """Build the manifest metadata.
 
     Iceberg owns the data; the manifest no longer enumerates snapshot
-    files (none are uploaded). Row counts are kept since they're useful
+    files (none are uploaded). Row counts are kept since they''re useful
     operational telemetry. Iceberg-specific details are added to the
     manifest by the caller once the Iceberg step has run.
     """

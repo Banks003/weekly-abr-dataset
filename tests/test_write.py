@@ -10,7 +10,13 @@ import pyarrow.parquet as pq
 
 from abr_extract.parse import parse_records
 from abr_extract.schema import parse_yyyymmdd
-from abr_extract.write import WriterBundle, WriterPaths, build_manifest, write_manifest
+from abr_extract.write import (
+    WriterBundle,
+    WriterPaths,
+    build_manifest,
+    materialize_sqlite,
+    write_manifest,
+)
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample_records.xml"
 
@@ -25,10 +31,20 @@ def _paths(tmp_path: Path) -> WriterPaths:
 
 
 def _run(tmp_path: Path, batch_size: int = 50) -> WriterPaths:
+    """Stream the fixture through WriterBundle (Parquet-only)."""
     paths = _paths(tmp_path)
     with WriterBundle(paths, batch_size=batch_size) as wb:
         for rec in parse_records(FIXTURE):
             wb.write(rec)
+    return paths
+
+
+def _run_with_sqlite(tmp_path: Path, batch_size: int = 50) -> WriterPaths:
+    """Stream the fixture through WriterBundle, then materialise SQLite."""
+    paths = _run(tmp_path, batch_size=batch_size)
+    materialize_sqlite(
+        paths.main_parquet, paths.trading_parquet, paths.dgr_parquet, paths.sqlite_db
+    )
     return paths
 
 
@@ -119,8 +135,18 @@ def test_dgr_parquet_captures_optional_fields(tmp_path: Path):
     assert "BUILDING & MAINTENANCE FUND" in with_name["dgr_name"]
 
 
-def test_sqlite_main_table_row_count(tmp_path: Path):
+# SQLite materialisation (M7 — DuckDB sqlite_scanner) -----------------------
+
+
+def test_writer_bundle_does_not_write_sqlite(tmp_path: Path):
+    """WriterBundle is Parquet-only after M7 — sqlite_db path is just a
+    field on WriterPaths, not opened during streaming writes."""
     paths = _run(tmp_path)
+    assert not paths.sqlite_db.exists()
+
+
+def test_sqlite_main_table_row_count(tmp_path: Path):
+    paths = _run_with_sqlite(tmp_path)
     conn = sqlite3.connect(paths.sqlite_db)
     n = conn.execute("SELECT COUNT(*) FROM abn_main").fetchone()[0]
     assert n == 9
@@ -128,18 +154,32 @@ def test_sqlite_main_table_row_count(tmp_path: Path):
 
 
 def test_sqlite_dates_stored_as_iso_strings(tmp_path: Path):
-    paths = _run(tmp_path)
+    """DuckDB DATE -> SQLite TEXT must round-trip as ISO YYYY-MM-DD —
+    the rest of the codebase (query.py) assumes string-typed dates."""
+    paths = _run_with_sqlite(tmp_path)
     conn = sqlite3.connect(paths.sqlite_db)
     row = conn.execute(
-        "SELECT abn_status_from_date FROM abn_main WHERE abn = ?",
+        "SELECT abn_status_from_date, record_last_updated, gst_status_from_date "
+        "FROM abn_main WHERE abn = ?",
         ("11000000948",),
     ).fetchone()
     assert row[0] == "1999-11-01"
+    # record_last_updated and gst_status_from_date should also be ISO strings
+    # (or None) — verify the storage class is TEXT, not REAL/INTEGER.
+    for value in row:
+        if value is not None:
+            assert isinstance(value, str)
+    # The 1900-01-01 GST sentinel must round-trip too.
+    sentinel_row = conn.execute(
+        "SELECT gst_status_from_date FROM abn_main WHERE abn = ?",
+        ("11000009496",),
+    ).fetchone()
+    assert sentinel_row[0] == "1900-01-01"
     conn.close()
 
 
 def test_sqlite_trading_and_dgr_have_indexed_abn_lookups(tmp_path: Path):
-    paths = _run(tmp_path)
+    paths = _run_with_sqlite(tmp_path)
     conn = sqlite3.connect(paths.sqlite_db)
     n_trading = conn.execute(
         "SELECT COUNT(*) FROM abn_trading_names WHERE abn = ?",
@@ -151,6 +191,46 @@ def test_sqlite_trading_and_dgr_have_indexed_abn_lookups(tmp_path: Path):
     ).fetchone()[0]
     assert n_dgr == 2
     conn.close()
+
+
+def test_sqlite_schema_preserves_pk_and_indices(tmp_path: Path):
+    """DuckDB CTAS doesn't preserve constraints, so materialize_sqlite
+    pre-creates the schema with DDL before INSERT. Verify all constraints
+    survive the round-trip."""
+    paths = _run_with_sqlite(tmp_path)
+    conn = sqlite3.connect(paths.sqlite_db)
+    try:
+        # PRIMARY KEY on abn_main.abn
+        info = conn.execute("PRAGMA table_info(abn_main)").fetchall()
+        abn_col = next(c for c in info if c[1] == "abn")
+        assert abn_col[5] == 1, "abn_main.abn must be PRIMARY KEY"
+
+        # Indices: idx_trading_names_abn, idx_dgr_abn, idx_main_state
+        indices = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='index' AND name LIKE 'idx_%'"
+            )
+        }
+        assert indices == {"idx_trading_names_abn", "idx_dgr_abn", "idx_main_state"}
+    finally:
+        conn.close()
+
+
+def test_sqlite_materialize_overwrites_existing_db(tmp_path: Path):
+    """Calling materialize_sqlite a second time should produce the same
+    output, not append duplicates."""
+    paths = _run_with_sqlite(tmp_path)
+    materialize_sqlite(
+        paths.main_parquet, paths.trading_parquet, paths.dgr_parquet, paths.sqlite_db
+    )
+    conn = sqlite3.connect(paths.sqlite_db)
+    try:
+        n = conn.execute("SELECT COUNT(*) FROM abn_main").fetchone()[0]
+        assert n == 9
+    finally:
+        conn.close()
 
 
 def test_batched_writes_match_unbatched(tmp_path: Path):
