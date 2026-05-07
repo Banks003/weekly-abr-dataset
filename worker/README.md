@@ -1,6 +1,12 @@
 # abr-api Worker
 
-Cloudflare Worker exposing the published dataset as JSON HTTP endpoints. DuckDB-WASM running inside the Worker reads parquets over HTTPS at `gazetteer.au`; the CF edge cache absorbs repeat range reads.
+Cloudflare Worker exposing the published dataset as JSON HTTP endpoints.
+
+**Status:** URL contract is live. Query engine is **deferred** — DuckDB-WASM was the planned backend but it can't run in Cloudflare Workers (CF Workers don't support nested Web Workers, which DuckDB-WASM requires). Routes that read the parquet currently return `{placeholder: true, ...}`. Real queries are served by the Python CLI (`abr-extract profile/search/trends`, optionally with `--cache-dir` for fast repeat use).
+
+The two query-engine paths under consideration:
+- **hyparquet** (pure-JS Parquet reader): no SQL, ~150 LOC of handcrafted JS reduce loops per endpoint. Works in CF Workers.
+- **Cloudflare Containers** (released 2025): full Node, can run real `duckdb-node`. Paid only.
 
 ## Endpoints (REST v1)
 

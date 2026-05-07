@@ -1,30 +1,29 @@
 /**
  * ABR API — RESTful v1 endpoints over the published dataset.
  *
- * Resources:
- *   /v1/abns            — search and per-ABN profile
- *   /v1/states          — Australian states/territories
- *   /v1/entity-types    — ABR entity-type taxonomy
- *   /v1/aggregations    — cross-cutting time-series with filters
- *   /manifest           — dataset metadata (unversioned)
+ * Status: URL contract is final, query engine is deferred. Routes that
+ * need to read the parquet return `{placeholder: true, ...}` until we
+ * pick a CF-Workers-compatible query engine (DuckDB-WASM doesn't work
+ * because CF Workers don't support nested Web Workers — see worker/README).
  *
- * Backed by DuckDB-WASM. Parquet files read over HTTPS at DATA_BASE_URL.
+ * What works today:
+ *   - GET /              — discovery
+ *   - GET /manifest      — proxies the R2 manifest.json (5 min cache)
+ *
+ * What's stubbed (URL contract live, response is placeholder):
+ *   - GET /v1/abns?q=&in=&limit=
+ *   - GET /v1/abns/:abn
+ *   - GET /v1/states
+ *   - GET /v1/states/:code
+ *   - GET /v1/states/:code/abns?status=&limit=&offset=
+ *   - GET /v1/states/:code/{registrations,cancellations}?since=&by=
+ *   - GET /v1/entity-types
+ *   - GET /v1/entity-types/:code
+ *   - GET /v1/entity-types/:code/abns?state=&status=&limit=&offset=
+ *   - GET /v1/aggregations/{registrations,cancellations}?...
  */
 
 import { Hono } from 'hono';
-import {
-  aggregateCancellations,
-  aggregateRegistrations,
-  getEntityType,
-  getState,
-  isValidState,
-  listAbnsForEntityType,
-  listAbnsInState,
-  listEntityTypes,
-  listStates,
-  profileAbn,
-  searchAbns,
-} from './queries';
 
 type Env = {
   DATA_BASE_URL: string;
@@ -32,6 +31,19 @@ type Env = {
 };
 
 const app = new Hono<{ Bindings: Env }>();
+
+const VALID_STATE_CODES = new Set([
+  'NSW', 'VIC', 'QLD', 'SA', 'WA', 'TAS', 'NT', 'ACT', 'AAT',
+]);
+
+function notImplemented(extra: Record<string, unknown> = {}) {
+  return {
+    placeholder: true,
+    note: 'Query engine not yet wired in this worker. Use the Python CLI: '
+      + 'abr-extract profile / search / trends. URL contract is stable.',
+    ...extra,
+  };
+}
 
 // --- root + dataset metadata ------------------------------------------
 
@@ -41,6 +53,7 @@ app.get('/', (c) =>
     version: '0.1.0',
     description: 'Australian Business Register query API on top of weekly-abr-dataset',
     base: c.env.DATA_BASE_URL,
+    status: 'URL contract live; query engine deferred (see worker/README.md)',
     endpoints: {
       manifest: 'GET /manifest',
       abns: {
@@ -81,157 +94,91 @@ app.get('/manifest', async (c) => {
 
 // --- /v1/abns ---------------------------------------------------------
 
-app.get('/v1/abns', async (c) => {
+app.get('/v1/abns', (c) => {
   const q = c.req.query('q');
   if (!q) return c.json({ error: 'q is required' }, 400);
-  const limit = Math.min(parseInt(c.req.query('limit') ?? '20', 10), 100);
-  const searchIn = (c.req.query('in') ?? 'all') as 'all' | 'main' | 'trading' | 'individual';
-  return runQuery(c, () => searchAbns(c.env.DATA_BASE_URL, q, { searchIn, limit }), {
-    cacheControl: 'public, max-age=600',
-  });
+  return c.json(notImplemented({ q, in: c.req.query('in') ?? 'all', limit: c.req.query('limit') ?? '20' }));
 });
 
-app.get('/v1/abns/:abn', async (c) => {
+app.get('/v1/abns/:abn', (c) => {
   const abn = c.req.param('abn');
   if (!/^\d{11}$/.test(abn)) return c.json({ error: 'abn must be 11 digits' }, 400);
-  try {
-    const profile = await profileAbn(c.env.DATA_BASE_URL, abn);
-    if (!profile) return c.json({ error: `ABN ${abn} not found` }, 404);
-    return c.json(profile, 200, { 'cache-control': 'public, max-age=3600' });
-  } catch (err: any) {
-    return c.json({ error: 'query failed', detail: String(err?.message ?? err) }, 500);
-  }
+  return c.json(notImplemented({ abn }));
 });
 
 // --- /v1/states -------------------------------------------------------
 
-app.get('/v1/states', async (c) =>
-  runQuery(c, () => listStates(c.env.DATA_BASE_URL), { cacheControl: 'public, max-age=86400' })
+app.get('/v1/states', (c) =>
+  c.json({
+    states: [...VALID_STATE_CODES].map((code) => ({ code, active_abns: null })),
+    note: 'state codes are stable; counts will populate when the query engine lands',
+  })
 );
 
-app.get('/v1/states/:code', async (c) => {
-  const code = c.req.param('code');
-  if (!isValidState(code)) return c.json({ error: `unknown state code: ${code}` }, 400);
-  try {
-    const detail = await getState(c.env.DATA_BASE_URL, code);
-    if (!detail) return c.json({ error: `state ${code} has no records` }, 404);
-    return c.json(detail, 200, { 'cache-control': 'public, max-age=3600' });
-  } catch (err: any) {
-    return c.json({ error: 'query failed', detail: String(err?.message ?? err) }, 500);
-  }
+app.get('/v1/states/:code', (c) => {
+  const code = c.req.param('code').toUpperCase();
+  if (!VALID_STATE_CODES.has(code)) return c.json({ error: `unknown state code: ${code}` }, 400);
+  return c.json(notImplemented({ code }));
 });
 
-app.get('/v1/states/:code/abns', async (c) => {
-  const code = c.req.param('code');
-  if (!isValidState(code)) return c.json({ error: `unknown state code: ${code}` }, 400);
-  const status = c.req.query('status') as 'ACT' | 'CAN' | undefined;
-  const limit = Math.min(parseInt(c.req.query('limit') ?? '50', 10), 500);
-  const offset = Math.max(parseInt(c.req.query('offset') ?? '0', 10), 0);
-  return runQuery(
-    c,
-    () => listAbnsInState(c.env.DATA_BASE_URL, code, { status, limit, offset }),
-    { cacheControl: 'public, max-age=600' }
-  );
+app.get('/v1/states/:code/abns', (c) => {
+  const code = c.req.param('code').toUpperCase();
+  if (!VALID_STATE_CODES.has(code)) return c.json({ error: `unknown state code: ${code}` }, 400);
+  return c.json(notImplemented({ code, status: c.req.query('status'), limit: c.req.query('limit') ?? '50', offset: c.req.query('offset') ?? '0' }));
 });
 
-app.get('/v1/states/:code/registrations', async (c) => {
-  const code = c.req.param('code');
-  if (!isValidState(code)) return c.json({ error: `unknown state code: ${code}` }, 400);
-  const since = c.req.query('since') ?? '2020-01-01';
-  const by = (c.req.query('by') ?? 'month') as 'month' | 'year';
-  return runQuery(
-    c,
-    () => aggregateRegistrations(c.env.DATA_BASE_URL, { state: code, since, groupBy: by }),
-    { cacheControl: 'public, max-age=86400' }
-  );
+app.get('/v1/states/:code/registrations', (c) => {
+  const code = c.req.param('code').toUpperCase();
+  if (!VALID_STATE_CODES.has(code)) return c.json({ error: `unknown state code: ${code}` }, 400);
+  return c.json(notImplemented({ code, since: c.req.query('since') ?? '2020-01-01', by: c.req.query('by') ?? 'month' }));
 });
 
-app.get('/v1/states/:code/cancellations', async (c) => {
-  const code = c.req.param('code');
-  if (!isValidState(code)) return c.json({ error: `unknown state code: ${code}` }, 400);
-  const since = c.req.query('since') ?? '2020-01-01';
-  const by = (c.req.query('by') ?? 'month') as 'month' | 'year';
-  return runQuery(
-    c,
-    () => aggregateCancellations(c.env.DATA_BASE_URL, { state: code, since, groupBy: by }),
-    { cacheControl: 'public, max-age=86400' }
-  );
+app.get('/v1/states/:code/cancellations', (c) => {
+  const code = c.req.param('code').toUpperCase();
+  if (!VALID_STATE_CODES.has(code)) return c.json({ error: `unknown state code: ${code}` }, 400);
+  return c.json(notImplemented({ code, since: c.req.query('since') ?? '2020-01-01', by: c.req.query('by') ?? 'month' }));
 });
 
 // --- /v1/entity-types -------------------------------------------------
 
-app.get('/v1/entity-types', async (c) =>
-  runQuery(c, () => listEntityTypes(c.env.DATA_BASE_URL), {
-    cacheControl: 'public, max-age=86400',
-  })
+app.get('/v1/entity-types', (c) =>
+  c.json(notImplemented({}))
 );
 
-app.get('/v1/entity-types/:code', async (c) => {
-  const code = c.req.param('code');
-  try {
-    const detail = await getEntityType(c.env.DATA_BASE_URL, code);
-    if (!detail) return c.json({ error: `entity type ${code} not found` }, 404);
-    return c.json(detail, 200, { 'cache-control': 'public, max-age=3600' });
-  } catch (err: any) {
-    return c.json({ error: 'query failed', detail: String(err?.message ?? err) }, 500);
-  }
+app.get('/v1/entity-types/:code', (c) => {
+  const code = c.req.param('code').toUpperCase();
+  return c.json(notImplemented({ code }));
 });
 
-app.get('/v1/entity-types/:code/abns', async (c) => {
-  const code = c.req.param('code');
-  const state = c.req.query('state') ?? undefined;
-  const status = c.req.query('status') as 'ACT' | 'CAN' | undefined;
-  const limit = Math.min(parseInt(c.req.query('limit') ?? '50', 10), 500);
-  const offset = Math.max(parseInt(c.req.query('offset') ?? '0', 10), 0);
-  return runQuery(
-    c,
-    () =>
-      listAbnsForEntityType(c.env.DATA_BASE_URL, code, { state, status, limit, offset }),
-    { cacheControl: 'public, max-age=600' }
-  );
+app.get('/v1/entity-types/:code/abns', (c) => {
+  const code = c.req.param('code').toUpperCase();
+  return c.json(notImplemented({
+    code,
+    state: c.req.query('state'),
+    status: c.req.query('status'),
+    limit: c.req.query('limit') ?? '50',
+    offset: c.req.query('offset') ?? '0',
+  }));
 });
 
 // --- /v1/aggregations -------------------------------------------------
 
-app.get('/v1/aggregations/registrations', async (c) => {
-  const opts = {
-    state: c.req.query('state') ?? undefined,
-    entityType: c.req.query('entity_type') ?? undefined,
+app.get('/v1/aggregations/registrations', (c) =>
+  c.json(notImplemented({
+    state: c.req.query('state'),
+    entity_type: c.req.query('entity_type'),
     since: c.req.query('since') ?? '2020-01-01',
-    groupBy: (c.req.query('by') ?? 'month') as 'month' | 'year',
-  };
-  return runQuery(c, () => aggregateRegistrations(c.env.DATA_BASE_URL, opts), {
-    cacheControl: 'public, max-age=86400',
-  });
-});
+    by: c.req.query('by') ?? 'month',
+  }))
+);
 
-app.get('/v1/aggregations/cancellations', async (c) => {
-  const opts = {
-    state: c.req.query('state') ?? undefined,
-    entityType: c.req.query('entity_type') ?? undefined,
+app.get('/v1/aggregations/cancellations', (c) =>
+  c.json(notImplemented({
+    state: c.req.query('state'),
+    entity_type: c.req.query('entity_type'),
     since: c.req.query('since') ?? '2020-01-01',
-    groupBy: (c.req.query('by') ?? 'month') as 'month' | 'year',
-  };
-  return runQuery(c, () => aggregateCancellations(c.env.DATA_BASE_URL, opts), {
-    cacheControl: 'public, max-age=86400',
-  });
-});
-
-// --- shared error wrapping --------------------------------------------
-
-async function runQuery<T>(
-  c: any,
-  fn: () => Promise<T>,
-  opts: { cacheControl?: string } = {}
-) {
-  try {
-    const result = await fn();
-    return c.json(result, 200, {
-      'cache-control': opts.cacheControl ?? 'public, max-age=600',
-    });
-  } catch (err: any) {
-    return c.json({ error: 'query failed', detail: String(err?.message ?? err) }, 500);
-  }
-}
+    by: c.req.query('by') ?? 'month',
+  }))
+);
 
 export default app;
