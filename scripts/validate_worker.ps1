@@ -53,7 +53,7 @@ try {
         -PassThru -NoNewWindow
 
     # 3. Poll until ready (max 60s).
-    $base = "http://localhost:8787"
+    $base = "http://127.0.0.1:8787"
     $ready = $false
     for ($i = 0; $i -lt 60; $i++) {
         Start-Sleep -Seconds 1
