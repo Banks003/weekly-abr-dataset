@@ -1,7 +1,6 @@
 /**
- * SQL templates that mirror the Python query.py functions. Same shape of
- * results — when the Worker is healthy, the CLI and Worker should produce
- * identical JSON for the same inputs.
+ * SQL query helpers backing the v1 REST endpoints. All read parquet over
+ * HTTPS at DATA_BASE_URL via DuckDB-WASM's HTTPFS.
  */
 
 import { query } from './duckdb';
@@ -19,6 +18,16 @@ function urls(base: string) {
     dgr: `${base}/${FILES.dgr}`,
   };
 }
+
+const VALID_STATE_CODES = new Set([
+  'NSW', 'VIC', 'QLD', 'SA', 'WA', 'TAS', 'NT', 'ACT', 'AAT',
+]);
+
+export function isValidState(code: string): boolean {
+  return VALID_STATE_CODES.has(code.toUpperCase());
+}
+
+// --- /v1/abns ----------------------------------------------------------
 
 export async function searchAbns(
   base: string,
@@ -71,7 +80,10 @@ export async function searchAbns(
 
 export async function profileAbn(base: string, abn: string): Promise<Record<string, any> | null> {
   const u = urls(base);
-  const main = (await query(`SELECT * FROM read_parquet('${u.main}') WHERE abn = ?`, [abn])) as any[];
+  const main = (await query(
+    `SELECT * FROM read_parquet('${u.main}') WHERE abn = ?`,
+    [abn]
+  )) as any[];
   if (!main.length) return null;
   const m = main[0];
 
@@ -113,45 +125,197 @@ export async function profileAbn(base: string, abn: string): Promise<Record<stri
   };
 }
 
-export async function trendsByMetric(
-  base: string,
-  metric: 'registrations' | 'cancellations' | 'by_state' | 'by_entity_type',
-  opts: { since?: string; groupBy?: 'month' | 'year' } = {}
-): Promise<unknown[]> {
+// --- /v1/states --------------------------------------------------------
+
+export async function listStates(base: string): Promise<unknown[]> {
   const u = urls(base);
+  return query(`
+    SELECT state AS code, COUNT(*) AS active_abns
+    FROM read_parquet('${u.main}')
+    WHERE abn_status = 'ACT' AND state IS NOT NULL
+    GROUP BY state
+    ORDER BY active_abns DESC
+  `);
+}
+
+export async function getState(base: string, code: string): Promise<Record<string, any> | null> {
+  const u = urls(base);
+  const c = code.toUpperCase();
+  const rows = (await query(
+    `
+    SELECT
+      ? AS code,
+      COUNT(*) FILTER (WHERE abn_status = 'ACT') AS active,
+      COUNT(*) FILTER (WHERE abn_status = 'CAN') AS cancelled,
+      COUNT(*) AS total
+    FROM read_parquet('${u.main}')
+    WHERE state = ?
+    `,
+    [c, c]
+  )) as any[];
+  if (!rows.length || rows[0].total === 0) return null;
+  return { code: c, counts: { active: rows[0].active, cancelled: rows[0].cancelled, total: rows[0].total } };
+}
+
+export async function listAbnsInState(
+  base: string,
+  code: string,
+  opts: { status?: 'ACT' | 'CAN'; limit?: number; offset?: number } = {}
+): Promise<{ total: number; abns: unknown[] }> {
+  const u = urls(base);
+  const c = code.toUpperCase();
+  const limit = Math.min(opts.limit ?? 50, 500);
+  const offset = Math.max(opts.offset ?? 0, 0);
+  const statusFilter = opts.status
+    ? `AND abn_status = '${opts.status === 'ACT' ? 'ACT' : 'CAN'}'`
+    : '';
+
+  const totalRows = (await query(
+    `SELECT COUNT(*) AS n FROM read_parquet('${u.main}') WHERE state = ? ${statusFilter}`,
+    [c]
+  )) as any[];
+
+  const abns = await query(
+    `SELECT abn, main_name, entity_type_ind, entity_type_text, postcode, abn_status, gst_status
+     FROM read_parquet('${u.main}')
+     WHERE state = ? ${statusFilter}
+     ORDER BY abn
+     LIMIT ? OFFSET ?`,
+    [c, limit, offset]
+  );
+  return { total: Number(totalRows[0]?.n ?? 0), abns };
+}
+
+// --- /v1/entity-types --------------------------------------------------
+
+export async function listEntityTypes(base: string): Promise<unknown[]> {
+  const u = urls(base);
+  return query(`
+    SELECT entity_type_ind AS code, entity_type_text AS text, COUNT(*) AS active_abns
+    FROM read_parquet('${u.main}')
+    WHERE abn_status = 'ACT'
+    GROUP BY 1, 2
+    ORDER BY active_abns DESC
+  `);
+}
+
+export async function getEntityType(
+  base: string,
+  code: string
+): Promise<Record<string, any> | null> {
+  const u = urls(base);
+  const c = code.toUpperCase();
+  const rows = (await query(
+    `
+    SELECT
+      entity_type_ind AS code,
+      MAX(entity_type_text) AS text,
+      COUNT(*) FILTER (WHERE abn_status = 'ACT') AS active,
+      COUNT(*) FILTER (WHERE abn_status = 'CAN') AS cancelled,
+      COUNT(*) AS total
+    FROM read_parquet('${u.main}')
+    WHERE entity_type_ind = ?
+    GROUP BY 1
+    `,
+    [c]
+  )) as any[];
+  if (!rows.length) return null;
+  return {
+    code: c,
+    text: rows[0].text,
+    counts: { active: rows[0].active, cancelled: rows[0].cancelled, total: rows[0].total },
+  };
+}
+
+export async function listAbnsForEntityType(
+  base: string,
+  code: string,
+  opts: { state?: string; status?: 'ACT' | 'CAN'; limit?: number; offset?: number } = {}
+): Promise<{ total: number; abns: unknown[] }> {
+  const u = urls(base);
+  const c = code.toUpperCase();
+  const limit = Math.min(opts.limit ?? 50, 500);
+  const offset = Math.max(opts.offset ?? 0, 0);
+
+  const filters: string[] = ['entity_type_ind = ?'];
+  const filterParams: unknown[] = [c];
+  if (opts.state) {
+    filters.push('state = ?');
+    filterParams.push(opts.state.toUpperCase());
+  }
+  if (opts.status) {
+    filters.push('abn_status = ?');
+    filterParams.push(opts.status);
+  }
+  const where = filters.join(' AND ');
+
+  const totalRows = (await query(
+    `SELECT COUNT(*) AS n FROM read_parquet('${u.main}') WHERE ${where}`,
+    filterParams
+  )) as any[];
+
+  const abns = await query(
+    `SELECT abn, main_name, state, postcode, abn_status, gst_status
+     FROM read_parquet('${u.main}')
+     WHERE ${where}
+     ORDER BY abn
+     LIMIT ? OFFSET ?`,
+    [...filterParams, limit, offset]
+  );
+  return { total: Number(totalRows[0]?.n ?? 0), abns };
+}
+
+// --- /v1/aggregations -------------------------------------------------
+
+type AggOpts = {
+  state?: string;
+  entityType?: string;
+  since?: string;
+  groupBy?: 'month' | 'year';
+};
+
+function buildAggregation(metric: 'registrations' | 'cancellations', opts: AggOpts) {
   const since = opts.since ?? '2020-01-01';
   const groupBy = opts.groupBy ?? 'month';
-
-  if (metric === 'registrations' || metric === 'cancellations') {
-    const fmt = groupBy === 'month' ? '%Y-%m' : '%Y';
-    const bucket = groupBy === 'month' ? 'month' : 'year';
-    const statusFilter = metric === 'cancellations' ? "abn_status = 'CAN'" : 'TRUE';
-    return query(
-      `SELECT strftime(abn_status_from_date, '${fmt}') AS ${bucket}, COUNT(*) AS n
-       FROM read_parquet('${u.main}')
-       WHERE abn_status_from_date >= ? AND ${statusFilter} AND abn_status_from_date IS NOT NULL
-       GROUP BY 1 ORDER BY 1`,
-      [since]
-    );
+  const fmt = groupBy === 'month' ? '%Y-%m' : '%Y';
+  const bucket = groupBy === 'month' ? 'month' : 'year';
+  const filters: string[] = [
+    'abn_status_from_date >= ?',
+    'abn_status_from_date IS NOT NULL',
+  ];
+  const params: unknown[] = [since];
+  if (metric === 'cancellations') filters.push("abn_status = 'CAN'");
+  if (opts.state) {
+    filters.push('state = ?');
+    params.push(opts.state.toUpperCase());
   }
-
-  if (metric === 'by_state') {
-    return query(
-      `SELECT state, COUNT(*) AS n
-       FROM read_parquet('${u.main}')
-       WHERE abn_status = 'ACT' AND state IS NOT NULL
-       GROUP BY state ORDER BY n DESC`
-    );
+  if (opts.entityType) {
+    filters.push('entity_type_ind = ?');
+    params.push(opts.entityType.toUpperCase());
   }
+  return { fmt, bucket, where: filters.join(' AND '), params };
+}
 
-  if (metric === 'by_entity_type') {
-    return query(
-      `SELECT entity_type_ind AS code, entity_type_text AS text, COUNT(*) AS n
-       FROM read_parquet('${u.main}')
-       WHERE abn_status = 'ACT'
-       GROUP BY 1, 2 ORDER BY n DESC`
-    );
-  }
+export async function aggregateRegistrations(base: string, opts: AggOpts = {}): Promise<unknown[]> {
+  const u = urls(base);
+  const a = buildAggregation('registrations', opts);
+  return query(
+    `SELECT strftime(abn_status_from_date, '${a.fmt}') AS ${a.bucket}, COUNT(*) AS n
+     FROM read_parquet('${u.main}')
+     WHERE ${a.where}
+     GROUP BY 1 ORDER BY 1`,
+    a.params
+  );
+}
 
-  throw new Error(`Unknown metric: ${metric}`);
+export async function aggregateCancellations(base: string, opts: AggOpts = {}): Promise<unknown[]> {
+  const u = urls(base);
+  const a = buildAggregation('cancellations', opts);
+  return query(
+    `SELECT strftime(abn_status_from_date, '${a.fmt}') AS ${a.bucket}, COUNT(*) AS n
+     FROM read_parquet('${u.main}')
+     WHERE ${a.where}
+     GROUP BY 1 ORDER BY 1`,
+    a.params
+  );
 }

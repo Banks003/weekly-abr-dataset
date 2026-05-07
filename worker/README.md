@@ -2,15 +2,26 @@
 
 Cloudflare Worker exposing the published dataset as JSON HTTP endpoints. DuckDB-WASM running inside the Worker reads parquets over HTTPS at `gazetteer.au`; the CF edge cache absorbs repeat range reads.
 
-## Endpoints
+## Endpoints (REST v1)
 
 | Route | Description | Cache |
 |---|---|---|
 | `GET /` | API discovery | — |
 | `GET /manifest` | Latest `manifest.json` proxy | 5 min |
-| `GET /abn/:abn` | Full profile for one ABN | 1 hr |
-| `GET /search?q=&in=&limit=` | Search by name | 10 min |
-| `GET /trends/:metric?since=&by=` | Pre-baked aggregations | 1 day |
+| `GET /v1/abns?q=&in=&limit=` | Search by name | 10 min |
+| `GET /v1/abns/:abn` | Full profile for one ABN | 1 hr |
+| `GET /v1/states` | All states with active-ABN counts | 1 day |
+| `GET /v1/states/:code` | State detail (active/cancelled/total) | 1 hr |
+| `GET /v1/states/:code/abns?status=&limit=&offset=` | Paginated ABNs in state | 10 min |
+| `GET /v1/states/:code/registrations?since=&by=` | State-scoped registration time series | 1 day |
+| `GET /v1/states/:code/cancellations?since=&by=` | State-scoped cancellation time series | 1 day |
+| `GET /v1/entity-types` | All entity types with active-ABN counts | 1 day |
+| `GET /v1/entity-types/:code` | Entity type detail | 1 hr |
+| `GET /v1/entity-types/:code/abns?state=&status=&limit=&offset=` | Paginated ABNs by entity type | 10 min |
+| `GET /v1/aggregations/registrations?state=&entity_type=&since=&by=` | Filtered registration time series | 1 day |
+| `GET /v1/aggregations/cancellations?state=&entity_type=&since=&by=` | Filtered cancellation time series | 1 day |
+
+State codes: NSW VIC QLD SA WA TAS NT ACT AAT. Entity-type codes are the 3-letter ABR codes (PUB, PRV, IND, SMF, …).
 
 Response shapes match the Python CLI (`abr-extract profile/search/trends`) — same SQL, same JSON.
 

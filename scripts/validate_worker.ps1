@@ -74,11 +74,16 @@ try {
     $probes = @(
         @{ Name = "discovery";    Url = "$base/" }
         @{ Name = "manifest";     Url = "$base/manifest" }
-        @{ Name = "profile (DuckDB-WASM cold)"; Url = "$base/abn/16009661901" }
-        @{ Name = "profile (warm)"; Url = "$base/abn/11000013098" }
-        @{ Name = "search qantas"; Url = "$base/search?q=qantas&limit=3" }
-        @{ Name = "trends by_state"; Url = "$base/trends/by_state" }
-        @{ Name = "trends registrations"; Url = "$base/trends/registrations?since=2024-01-01&by=month" }
+        @{ Name = "abn profile (DuckDB-WASM cold)"; Url = "$base/v1/abns/16009661901" }
+        @{ Name = "abn profile (warm)"; Url = "$base/v1/abns/11000013098" }
+        @{ Name = "abns search"; Url = "$base/v1/abns?q=qantas&limit=3" }
+        @{ Name = "states list"; Url = "$base/v1/states" }
+        @{ Name = "states detail (NSW)"; Url = "$base/v1/states/NSW" }
+        @{ Name = "abns in state (NSW limit=3)"; Url = "$base/v1/states/NSW/abns?status=ACT&limit=3" }
+        @{ Name = "state registrations"; Url = "$base/v1/states/NSW/registrations?since=2024-01-01&by=month" }
+        @{ Name = "entity-types list"; Url = "$base/v1/entity-types" }
+        @{ Name = "entity-type detail (PUB)"; Url = "$base/v1/entity-types/PUB" }
+        @{ Name = "agg registrations (NSW + PRV)"; Url = "$base/v1/aggregations/registrations?state=NSW&entity_type=PRV&since=2024-01-01&by=month" }
     )
 
     foreach ($p in $probes) {
