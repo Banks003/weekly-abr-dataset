@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import uuid
 import zipfile
@@ -22,6 +23,7 @@ from .iceberg_io import (
     ABN_DGR_HISTORY_SCHEMA,
     ABN_MAIN_HISTORY_SCHEMA,
     ABN_TRADING_HISTORY_SCHEMA,
+    build_snapshot_manifest,
     connect_r2_catalog,
     ensure_history_tables,
     load_iceberg_settings_from_env,
@@ -147,6 +149,30 @@ def run(
         )
         click.echo(f"Iceberg history step ({iceberg_ns}): {iceberg_summary}")
 
+    iceberg_snapshot_manifest: dict | None = None
+    if not skip_iceberg:
+        # M10 — publish iceberg-snapshot.json so the frontend (and CLI
+        # via query.py) can read directly from Iceberg data files.
+        iceberg_bucket = (
+            settings.bucket if settings is not None else os.environ.get(
+                "R2_BUCKET", "weekly-abr-dataset"
+            )
+        )
+        iceberg_snapshot_manifest = _build_iceberg_snapshot_manifest(
+            namespace=iceberg_ns,
+            generated_at=started.isoformat().replace("+00:00", "Z"),
+            extract_time=extract_time_iso,
+            bucket=iceberg_bucket,
+        )
+        # Always write the local copy so we can inspect runs that
+        # skipped publish.
+        snap_path = work_dir / "iceberg-snapshot.json"
+        snap_path.write_text(
+            json.dumps(iceberg_snapshot_manifest, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        click.echo(f"Iceberg snapshot manifest: {snap_path}")
+
     manifest = build_manifest(
         paths,
         counts,
@@ -157,6 +183,8 @@ def run(
     if iceberg_summary is not None:
         manifest["iceberg"] = iceberg_summary
         manifest["iceberg_namespace"] = iceberg_ns
+    if iceberg_snapshot_manifest is not None:
+        manifest["iceberg_snapshot_url"] = f"{public_base_url_for(settings)}/iceberg-snapshot.json"
     if truncated:
         manifest["truncated"] = True
         manifest["max_records"] = max_records
@@ -173,6 +201,24 @@ def run(
     click.echo(f"Uploading to R2 bucket '{settings.bucket}'...")
     plans = plan_uploads(work_dir, extract_date=extract_date)
     upload_all(s3, settings.bucket, plans)
+    if iceberg_snapshot_manifest is not None:
+        snap_body = json.dumps(
+            iceberg_snapshot_manifest, indent=2, sort_keys=True
+        ).encode("utf-8")
+        for key in (
+            "iceberg-snapshot.json",
+            f"iceberg-snapshot-{extract_date}.json",
+        ):
+            s3.put_object(
+                Bucket=settings.bucket,
+                Key=key,
+                Body=snap_body,
+                ContentType="application/json",
+            )
+        click.echo(
+            f"Uploaded iceberg-snapshot.json + dated copy to "
+            f"{public_base_url_for(settings)}/iceberg-snapshot.json"
+        )
     click.echo(f"Uploaded {len(plans)} files (each as -latest and -{extract_date}).")
 
 
@@ -227,6 +273,32 @@ def _run_iceberg_step(
             schema=schema,
         )
     return summary
+
+
+def _build_iceberg_snapshot_manifest(
+    *,
+    namespace: str,
+    generated_at: str,
+    extract_time: str,
+    bucket: str,
+    public_base_url: str = "https://gazetteer.au",
+) -> dict:
+    """Build the iceberg-snapshot.json payload from the live R2 Data Catalog.
+
+    Re-connects to the catalog (cheap, env-driven) so this can run after
+    ``_run_iceberg_step`` without sharing in-memory state.
+    """
+    iceberg_settings = load_iceberg_settings_from_env()
+    catalog = connect_r2_catalog(iceberg_settings)
+    tables = ensure_history_tables(catalog, namespace=namespace)
+    return build_snapshot_manifest(
+        tables,
+        namespace=namespace,
+        generated_at=generated_at,
+        extract_time=extract_time,
+        bucket=bucket,
+        public_base_url=public_base_url,
+    )
 
 
 def _load_r2_settings() -> R2Settings:
@@ -485,3 +557,12 @@ def check() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def public_base_url_for(settings: R2Settings | None) -> str:
+    """Public CDN base URL where the bucket contents are served.
+
+    Currently always gazetteer.au; lifted into a function so it can be
+    overridden later via env var if we ever fork the deploy.
+    """
+    return os.environ.get("PUBLIC_BASE_URL", "https://gazetteer.au")
