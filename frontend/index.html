@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ABN search · gazetteer.au</title>
+  <style>
+    :root {
+      --fg: #1a1a1a;
+      --muted: #666;
+      --bg: #fafaf7;
+      --row-alt: #f0f0ed;
+      --accent: #0066cc;
+      --border: #d0d0c8;
+      --bad: #c33;
+      --good: #2a8a2a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      color: var(--fg); background: var(--bg);
+      margin: 0; padding: 24px;
+      max-width: 1400px; margin-inline: auto;
+    }
+    header { border-bottom: 1px solid var(--border); padding-bottom: 12px; margin-bottom: 16px; }
+    header h1 { margin: 0 0 4px 0; font-size: 22px; font-weight: 600; }
+    header p { margin: 0; color: var(--muted); font-size: 13px; }
+    header a { color: var(--accent); }
+    .controls {
+      display: flex; gap: 8px; flex-wrap: wrap;
+      align-items: center; margin-bottom: 8px;
+    }
+    .controls input, .controls select {
+      padding: 8px 10px; font: inherit; border: 1px solid var(--border);
+      background: white; border-radius: 4px;
+    }
+    .controls input[type=text] { flex: 1 1 320px; min-width: 200px; }
+    .controls select { background: white; }
+    .status { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
+    .status.error { color: var(--bad); }
+    .status.ready { color: var(--good); }
+    table { width: 100%; border-collapse: collapse; background: white; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+    thead { background: #efefea; }
+    th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    th { font-weight: 600; font-size: 13px; color: var(--muted); cursor: default; user-select: none; }
+    tr.expandable { cursor: pointer; }
+    tr.expandable:hover { background: var(--row-alt); }
+    tr.detail { background: #f7f6f0; }
+    tr.detail td { padding: 0 10px 12px 10px; border-bottom: 2px solid var(--border); }
+    .detail-grid {
+      display: grid; grid-template-columns: 200px 1fr; gap: 4px 12px;
+      font-size: 13px; padding: 8px 0;
+    }
+    .detail-grid dt { color: var(--muted); font-weight: 500; }
+    .detail-grid dd { margin: 0; }
+    .pill {
+      display: inline-block; padding: 1px 8px; border-radius: 10px;
+      font-size: 11px; font-weight: 600;
+    }
+    .pill.act { background: #e0f4e0; color: #2a8a2a; }
+    .pill.can { background: #f4e0e0; color: #c33; }
+    .pill.non { background: #eee; color: var(--muted); }
+    .pagination {
+      display: flex; gap: 12px; align-items: center; justify-content: space-between;
+      margin-top: 12px;
+    }
+    .pagination button {
+      padding: 6px 12px; font: inherit; cursor: pointer;
+      background: white; border: 1px solid var(--border); border-radius: 4px;
+    }
+    .pagination button:disabled { opacity: 0.5; cursor: default; }
+    .empty { text-align: center; color: var(--muted); padding: 40px; font-style: italic; }
+    code { background: #efefea; padding: 1px 5px; border-radius: 3px; font-size: 13px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Australian Business Register — searchable</h1>
+  <p>
+    20.16M active &amp; cancelled ABNs · refreshed weekly from
+    <a href="https://data.gov.au/data/dataset/abn-bulk-extract" target="_blank" rel="noopener">data.gov.au</a> ·
+    <a href="https://github.com/Banks003/weekly-abr-dataset" target="_blank" rel="noopener">source</a> ·
+    CC-BY 4.0
+  </p>
+</header>
+
+<div class="controls">
+  <input type="text" id="q" placeholder="Search name, ABN, trading name… (try &quot;qantas&quot;)">
+  <select id="state-filter">
+    <option value="">All states</option>
+    <option>NSW</option><option>VIC</option><option>QLD</option>
+    <option>WA</option><option>SA</option><option>TAS</option>
+    <option>ACT</option><option>NT</option><option>AAT</option>
+  </select>
+  <select id="status-filter">
+    <option value="">All statuses</option>
+    <option value="ACT">Active</option>
+    <option value="CAN">Cancelled</option>
+  </select>
+  <select id="entity-type-filter">
+    <option value="">All entity types</option>
+  </select>
+  <select id="page-size">
+    <option value="20">20 per page</option>
+    <option value="50" selected>50 per page</option>
+    <option value="100">100 per page</option>
+    <option value="200">200 per page</option>
+  </select>
+</div>
+
+<div class="status" id="status">Loading…</div>
+
+<table id="results-table" hidden>
+  <thead>
+    <tr>
+      <th>ABN</th>
+      <th>Name</th>
+      <th>Type</th>
+      <th>State</th>
+      <th>Postcode</th>
+      <th>Status</th>
+      <th>GST</th>
+    </tr>
+  </thead>
+  <tbody id="rows"></tbody>
+</table>
+
+<div class="pagination" id="pagination" hidden>
+  <button id="prev">← Previous</button>
+  <span id="page-info"></span>
+  <button id="next">Next →</button>
+</div>
+
+<script type="module">
+  import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm';
+
+  const DATA_BASE = 'https://gazetteer.au';
+  const MAIN_URL = `${DATA_BASE}/abn-main-latest.parquet`;
+  const TRADING_URL = `${DATA_BASE}/abn-trading-names-latest.parquet`;
+  const DGR_URL = `${DATA_BASE}/abn-dgr-latest.parquet`;
+
+  const $ = (id) => document.getElementById(id);
+  const status = $('status');
+  const rows = $('rows');
+  const table = $('results-table');
+  const pagination = $('pagination');
+  const pageInfo = $('page-info');
+
+  let db, conn;
+  let currentPage = 0;
+  let totalRows = 0;
+
+  async function init() {
+    status.textContent = 'Initialising DuckDB-WASM…';
+    const bundles = duckdb.getJsDelivrBundles();
+    const bundle = await duckdb.selectBundle(bundles);
+    const worker = await duckdb.createWorker(bundle.mainWorker);
+    const logger = new duckdb.ConsoleLogger();
+    db = new duckdb.AsyncDuckDB(logger, worker);
+    await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+    conn = await db.connect();
+    await conn.query("INSTALL httpfs; LOAD httpfs;");
+    status.textContent = 'Loading entity types…';
+    await populateEntityTypes();
+    status.className = 'status ready';
+    status.textContent = `Ready · data from ${DATA_BASE}`;
+    await refresh();
+  }
+
+  async function populateEntityTypes() {
+    const result = await conn.query(`
+      SELECT DISTINCT entity_type_ind AS code, MAX(entity_type_text) AS text
+      FROM read_parquet('${MAIN_URL}')
+      WHERE entity_type_ind IS NOT NULL
+      GROUP BY entity_type_ind
+      ORDER BY 1
+    `);
+    const sel = $('entity-type-filter');
+    for (const row of result.toArray().map(r => r.toJSON())) {
+      const opt = document.createElement('option');
+      opt.value = row.code;
+      opt.textContent = `${row.code} — ${row.text}`;
+      sel.appendChild(opt);
+    }
+  }
+
+  function buildWhere() {
+    const q = $('q').value.trim();
+    const state = $('state-filter').value;
+    const statusFilter = $('status-filter').value;
+    const entityType = $('entity-type-filter').value;
+    const filters = [];
+    const params = [];
+
+    if (q) {
+      // ABN exact match takes priority; otherwise name/trading prefix-or-substring
+      if (/^\d{11}$/.test(q.replace(/\s/g, ''))) {
+        filters.push('abn = ?');
+        params.push(q.replace(/\s/g, ''));
+      } else {
+        const pat = `%${q}%`;
+        filters.push(`(
+          main_name ILIKE ?
+          OR individual_family_name ILIKE ?
+          OR individual_given_names ILIKE ?
+          OR abn IN (SELECT abn FROM read_parquet('${TRADING_URL}') WHERE name ILIKE ?)
+        )`);
+        params.push(pat, pat, pat, pat);
+      }
+    }
+    if (state) { filters.push('state = ?'); params.push(state); }
+    if (statusFilter) { filters.push('abn_status = ?'); params.push(statusFilter); }
+    if (entityType) { filters.push('entity_type_ind = ?'); params.push(entityType); }
+    return { where: filters.length ? `WHERE ${filters.join(' AND ')}` : '', params };
+  }
+
+  async function countRows({ where, params }) {
+    const sql = `SELECT COUNT(*) AS n FROM read_parquet('${MAIN_URL}') ${where}`;
+    const stmt = await conn.prepare(sql);
+    const result = await stmt.query(...params);
+    await stmt.close();
+    return Number(result.toArray()[0].toJSON().n);
+  }
+
+  async function fetchPage({ where, params }, offset, limit) {
+    const sql = `
+      SELECT abn, main_name, individual_title, individual_given_names,
+             individual_family_name, entity_kind, entity_type_ind,
+             entity_type_text, state, postcode, abn_status,
+             gst_status, asic_number
+      FROM read_parquet('${MAIN_URL}')
+      ${where}
+      ORDER BY abn
+      LIMIT ? OFFSET ?
+    `;
+    const stmt = await conn.prepare(sql);
+    const result = await stmt.query(...params, limit, offset);
+    await stmt.close();
+    return result.toArray().map(r => r.toJSON());
+  }
+
+  async function fetchExtras(abn) {
+    const tradingSql = `
+      SELECT name, name_type
+      FROM read_parquet('${TRADING_URL}')
+      WHERE abn = ?
+      ORDER BY name_type, name
+    `;
+    const dgrSql = `
+      SELECT dgr_status_from_date AS "from", dgr_status, dgr_name
+      FROM read_parquet('${DGR_URL}')
+      WHERE abn = ?
+    `;
+    const tStmt = await conn.prepare(tradingSql);
+    const trading = (await tStmt.query(abn)).toArray().map(r => r.toJSON());
+    await tStmt.close();
+    const dStmt = await conn.prepare(dgrSql);
+    const dgr = (await dStmt.query(abn)).toArray().map(r => r.toJSON());
+    await dStmt.close();
+    return { trading, dgr };
+  }
+
+  function nameFor(row) {
+    if (row.entity_kind === 'legal') {
+      return [row.individual_title, row.individual_given_names, row.individual_family_name]
+        .filter(Boolean).join(' ');
+    }
+    return row.main_name ?? '';
+  }
+
+  function renderRows(records) {
+    rows.innerHTML = '';
+    if (!records.length) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td colspan="7" class="empty">No matches.</td>`;
+      rows.appendChild(tr);
+      return;
+    }
+    for (const r of records) {
+      const tr = document.createElement('tr');
+      tr.className = 'expandable';
+      tr.dataset.abn = r.abn;
+      const status = r.abn_status === 'ACT'
+        ? '<span class="pill act">Active</span>'
+        : '<span class="pill can">Cancelled</span>';
+      const gst = r.gst_status === 'ACT'
+        ? '<span class="pill act">GST</span>'
+        : (r.gst_status ? `<span class="pill non">${r.gst_status}</span>` : '');
+      tr.innerHTML = `
+        <td><code>${r.abn}</code></td>
+        <td>${escape(nameFor(r))}</td>
+        <td>${escape(r.entity_type_text ?? '')}</td>
+        <td>${r.state ?? ''}</td>
+        <td>${r.postcode ?? ''}</td>
+        <td>${status}</td>
+        <td>${gst}</td>
+      `;
+      tr.addEventListener('click', () => toggleDetail(tr, r));
+      rows.appendChild(tr);
+    }
+  }
+
+  function escape(s) {
+    return String(s).replace(/[&<>"']/g, (c) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  async function toggleDetail(tr, row) {
+    const next = tr.nextElementSibling;
+    if (next && next.classList.contains('detail') && next.dataset.for === row.abn) {
+      next.remove();
+      return;
+    }
+    document.querySelectorAll('tr.detail').forEach((n) => n.remove());
+    const detail = document.createElement('tr');
+    detail.className = 'detail';
+    detail.dataset.for = row.abn;
+    detail.innerHTML = `<td colspan="7"><dl class="detail-grid"><dt>Loading…</dt><dd></dd></dl></td>`;
+    tr.parentNode.insertBefore(detail, tr.nextSibling);
+
+    const { trading, dgr } = await fetchExtras(row.abn);
+    const grid = detail.querySelector('.detail-grid');
+    grid.innerHTML = '';
+    const add = (k, v) => {
+      const dt = document.createElement('dt'); dt.textContent = k;
+      const dd = document.createElement('dd'); dd.innerHTML = v ?? '';
+      grid.appendChild(dt); grid.appendChild(dd);
+    };
+    add('Main name', escape(row.main_name ?? '(individual)'));
+    if (row.entity_kind === 'legal') {
+      add('Individual', escape(nameFor(row)));
+    }
+    add('Entity type', `${escape(row.entity_type_text ?? '')} (<code>${row.entity_type_ind ?? ''}</code>)`);
+    add('Address', `${row.state ?? '—'} ${row.postcode ?? '—'}`);
+    add('ABN', `<code>${row.abn}</code>`);
+    add('ASIC / ACN', row.asic_number ? `<code>${row.asic_number}</code>` : '—');
+    add('ABN status', row.abn_status ?? '—');
+    add('GST status', row.gst_status ?? '—');
+    if (trading.length) {
+      const list = trading.map((t) => `${escape(t.name)} <code>[${t.name_type}]</code>`).join('<br>');
+      add(`Trading / business names (${trading.length})`, list);
+    }
+    if (dgr.length) {
+      const list = dgr.map((d) =>
+        `${d.from ?? ''} [${d.dgr_status ?? '—'}] ${escape(d.dgr_name ?? '(applies to main entity)')}`
+      ).join('<br>');
+      add(`DGR endorsements (${dgr.length})`, list);
+    }
+  }
+
+  async function refresh() {
+    const pageSize = Number($('page-size').value);
+    const filterSpec = buildWhere();
+    table.hidden = true; pagination.hidden = true;
+    status.className = 'status';
+    status.textContent = 'Counting…';
+    try {
+      totalRows = await countRows(filterSpec);
+      const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
+      if (currentPage >= totalPages) currentPage = 0;
+      status.textContent = `Querying page ${currentPage + 1} of ${totalPages.toLocaleString()}…`;
+      const records = await fetchPage(filterSpec, currentPage * pageSize, pageSize);
+      renderRows(records);
+      table.hidden = false;
+      pagination.hidden = false;
+      pageInfo.textContent = `Page ${(currentPage + 1).toLocaleString()} of ${totalPages.toLocaleString()} · ${totalRows.toLocaleString()} matches`;
+      $('prev').disabled = currentPage === 0;
+      $('next').disabled = (currentPage + 1) >= totalPages;
+      status.className = 'status ready';
+      status.textContent = `Ready · ${totalRows.toLocaleString()} matches`;
+    } catch (err) {
+      status.className = 'status error';
+      status.textContent = `Error: ${err.message ?? err}`;
+      console.error(err);
+    }
+  }
+
+  // Debounce input changes
+  let debounceTimer = null;
+  function debouncedRefresh() {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => { currentPage = 0; refresh(); }, 350);
+  }
+
+  $('q').addEventListener('input', debouncedRefresh);
+  $('state-filter').addEventListener('change', () => { currentPage = 0; refresh(); });
+  $('status-filter').addEventListener('change', () => { currentPage = 0; refresh(); });
+  $('entity-type-filter').addEventListener('change', () => { currentPage = 0; refresh(); });
+  $('page-size').addEventListener('change', () => { currentPage = 0; refresh(); });
+  $('prev').addEventListener('click', () => { currentPage--; refresh(); });
+  $('next').addEventListener('click', () => { currentPage++; refresh(); });
+
+  init().catch((err) => {
+    status.className = 'status error';
+    status.textContent = `Init failed: ${err.message ?? err}`;
+    console.error(err);
+  });
+</script>
+
+</body>
+</html>
