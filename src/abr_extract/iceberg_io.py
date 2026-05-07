@@ -297,60 +297,49 @@ def bootstrap_history_table_arrow(
     extract_date,
     *,
     record_last_updated_column: str | None = "record_last_updated",
-    batch_size: int = 250_000,
 ) -> dict:
-    """Stream-bootstrap an Iceberg history table from a snapshot Parquet.
+    """One-shot bootstrap an Iceberg history table from a snapshot Parquet.
 
-    Adds the three SCD2 columns (``valid_from``, ``valid_to``,
-    ``snapshot_observed_date``) to each pyarrow RecordBatch and appends to
-    the table. ``valid_from`` falls back to ``extract_date`` if the source
-    column is missing (trading_names, dgr) or null.
+    Reads the whole snapshot parquet to a pyarrow Table (cheaper than the
+    polars round-trip — pyarrow holds the column-oriented buffers near
+    the parquet native format, while polars copies them into its own
+    representation, roughly doubling memory). Adds the three SCD2 columns
+    via zero-copy ``append_column`` calls, casts once to the iceberg
+    arrow schema, and calls ``table.overwrite`` exactly once — a single
+    iceberg snapshot, no per-batch R2 commit overhead.
 
-    Compared to the polars path: no full-table materialisation, ~3GB of
-    peak memory savings, and no runner OOM.
+    Memory peaks at roughly the size of the snapshot parquet decompressed
+    (~1-2GB for the main relation), which is half the polars path's peak
+    and well within the 16GB ubuntu-latest runner''s headroom.
     """
     import pyarrow as pa
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
 
-    pf = pq.ParquetFile(parquet_path)
-    schema_arrow = table.schema().as_arrow()
+    arrow_table = pq.read_table(parquet_path)
+    n = arrow_table.num_rows
 
-    rows_written = 0
-    files_written = 0
-    for record_batch in pf.iter_batches(batch_size=batch_size):
-        n = record_batch.num_rows
-        extract_date_array = pa.array([extract_date] * n, type=pa.date32())
-        null_date_array = pa.nulls(n, type=pa.date32())
+    extract_date_array = pa.array([extract_date] * n, type=pa.date32())
+    null_date_array = pa.nulls(n, type=pa.date32())
 
-        if record_last_updated_column and record_last_updated_column in record_batch.schema.names:
-            valid_from = pc.coalesce(
-                record_batch.column(record_last_updated_column),
-                extract_date_array,
-            )
-        else:
-            valid_from = extract_date_array
-
-        # Build the Arrow table for this batch with the SCD2 columns appended.
-        batch_table = pa.Table.from_batches([record_batch])
-        batch_table = batch_table.append_column("valid_from", valid_from)
-        batch_table = batch_table.append_column("valid_to", null_date_array)
-        batch_table = batch_table.append_column(
-            "snapshot_observed_date", extract_date_array
+    if (
+        record_last_updated_column
+        and record_last_updated_column in arrow_table.column_names
+    ):
+        valid_from = pc.coalesce(
+            arrow_table.column(record_last_updated_column),
+            extract_date_array,
         )
-        # Cast to the iceberg schema so int / type widening matches.
-        batch_table = batch_table.cast(schema_arrow)
+    else:
+        valid_from = extract_date_array
 
-        if files_written == 0:
-            # First batch overwrites (clears any half-written prior state).
-            table.overwrite(batch_table)
-        else:
-            table.append(batch_table)
-        files_written += 1
-        rows_written += n
+    arrow_table = arrow_table.append_column("valid_from", valid_from)
+    arrow_table = arrow_table.append_column("valid_to", null_date_array)
+    arrow_table = arrow_table.append_column(
+        "snapshot_observed_date", extract_date_array
+    )
+    arrow_table = arrow_table.cast(table.schema().as_arrow())
 
-    return {
-        "mode": "bootstrap",
-        "rows_written": rows_written,
-        "batches": files_written,
-    }
+    table.overwrite(arrow_table)
+
+    return {"mode": "bootstrap", "rows_written": n, "batches": 1}
