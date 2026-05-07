@@ -6,7 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 # Public r2.dev URL for the bucket — used as a stable HTTPS read source
 # until DuckDB-WASM-over-R2-binding is wired up.
 [vars]
-DATA_BASE_URL = "https://pub-24e45cc5c0384bf1b367427d9777b0a8.r2.dev"
+DATA_BASE_URL = "https://gazetteer.au"
 
 # R2 binding for the published bucket. Available at env.DATA_BUCKET.
 [[r2_buckets]]

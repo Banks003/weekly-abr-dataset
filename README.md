@@ -15,13 +15,13 @@ This project fills the gap: a fresh, weekly Parquet drop that any tool with `pya
 
 ## Data
 
-Files are published to a public Cloudflare R2 bucket at `https://pub-24e45cc5c0384bf1b367427d9777b0a8.r2.dev/`. Direct URLs:
+Files are published to a public Cloudflare R2 bucket at `https://gazetteer.au/`. Direct URLs:
 
 ```
-https://pub-24e45cc5c0384bf1b367427d9777b0a8.r2.dev/abn-main-latest.parquet
-https://pub-24e45cc5c0384bf1b367427d9777b0a8.r2.dev/abn-trading-names-latest.parquet
-https://pub-24e45cc5c0384bf1b367427d9777b0a8.r2.dev/abn-dgr-latest.parquet
-https://pub-24e45cc5c0384bf1b367427d9777b0a8.r2.dev/abr-extract-latest.sqlite
+https://gazetteer.au/abn-main-latest.parquet
+https://gazetteer.au/abn-trading-names-latest.parquet
+https://gazetteer.au/abn-dgr-latest.parquet
+https://gazetteer.au/abr-extract-latest.sqlite
 ```
 
 Each refresh also writes a date-stamped copy: `abn-main-2026-05-07.parquet`, etc.
@@ -45,12 +45,12 @@ Field naming and types follow the convention in `iangow/abn_lookup`'s XSLT trans
 ```python
 import polars as pl
 
-df = pl.read_parquet("https://pub-24e45cc5c0384bf1b367427d9777b0a8.r2.dev/abn-main-latest.parquet")
+df = pl.read_parquet("https://gazetteer.au/abn-main-latest.parquet")
 ```
 
 ```sql
 -- DuckDB
-SELECT * FROM read_parquet('https://pub-24e45cc5c0384bf1b367427d9777b0a8.r2.dev/abn-main-latest.parquet')
+SELECT * FROM read_parquet('https://gazetteer.au/abn-main-latest.parquet')
 WHERE state = 'VIC' AND gst_status = 'ACT'
 LIMIT 10;
 ```

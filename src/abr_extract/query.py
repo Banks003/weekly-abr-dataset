@@ -22,7 +22,7 @@ from typing import Any
 import duckdb
 import httpx
 
-DEFAULT_SOURCE = "https://pub-24e45cc5c0384bf1b367427d9777b0a8.r2.dev"
+DEFAULT_SOURCE = "https://gazetteer.au"
 ABR_JSON_URL = "https://abr.business.gov.au/json/AbnDetails.aspx"
 
 
