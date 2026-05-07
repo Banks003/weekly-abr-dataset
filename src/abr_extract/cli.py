@@ -27,6 +27,12 @@ from .iceberg_io import (
     load_iceberg_settings_from_env,
     update_history_table,
 )
+from .parallel import (
+    DEFAULT_WORKERS,
+    build_sqlite_from_parquet,
+    merge_shards_to_parquet,
+    parse_zips_parallel,
+)
 from .parse import parse_records
 from .publish import (
     R2Settings,
@@ -35,6 +41,11 @@ from .publish import (
     plan_uploads,
     read_remote_manifest,
     upload_all,
+)
+from .schema import (
+    ABN_DGR_SCHEMA,
+    ABN_MAIN_SCHEMA,
+    ABN_TRADING_NAMES_SCHEMA,
 )
 from .write import WriterBundle, WriterPaths, build_manifest, write_manifest
 
@@ -66,8 +77,18 @@ def main() -> None:
     type=int,
     default=None,
     help="Truncate parse after N main records — full pipeline test mode. "
-    "Implies test-isolated Iceberg namespace (abr_test) and skips R2 "
-    "snapshot uploads so production artefacts are never overwritten.",
+    "Implies test-isolated Iceberg namespace (abr_test), skips R2 snapshot "
+    "uploads so production artefacts are never overwritten, and forces the "
+    "single-process parse path (truncation is a global stop condition that "
+    "can't be enforced cleanly across workers).",
+)
+@click.option(
+    "--workers",
+    type=int,
+    default=DEFAULT_WORKERS,
+    show_default=True,
+    help="Number of parallel parse workers. Set to 1 to force the legacy "
+    "single-process WriterBundle path (also implied by --max-records).",
 )
 def run(
     output_dir: str,
@@ -75,6 +96,7 @@ def run(
     skip_iceberg: bool,
     force: bool,
     max_records: int | None,
+    workers: int,
 ) -> None:
     """Run the full pipeline: fetch -> download -> parse -> write -> publish."""
     work_dir = Path(output_dir)
@@ -111,28 +133,66 @@ def run(
         sqlite_db=work_dir / "abr.sqlite",
     )
 
-    click.echo("Parsing and writing artefacts...")
     started = datetime.now(UTC)
-    done_early = False
-    with WriterBundle(paths) as wb:
-        for dr in download_results:
-            if done_early:
-                break
-            with zipfile.ZipFile(dr.path) as z:
-                for info in z.infolist():
-                    if done_early:
-                        break
-                    if not info.filename.endswith(".xml"):
-                        continue
-                    click.echo(f"  parsing {info.filename}...")
-                    with z.open(info) as f:
-                        for record in parse_records(f):
-                            wb.write(record)
-                            if truncated and wb.counts.main >= max_records:
-                                done_early = True
-                                break
+    use_parallel = workers > 1 and not truncated
+    if use_parallel:
+        click.echo(f"Parsing in parallel ({workers} workers)...")
+        shard_dir = work_dir / "shards"
+        zip_paths = [dr.path for dr in download_results]
 
-    counts = wb.counts
+        def _on_shard(result) -> None:
+            click.echo(
+                f"  parsed {result.inner_filename} "
+                f"(main={result.counts.main:,} trading={result.counts.trading:,} "
+                f"dgr={result.counts.dgr:,})"
+            )
+
+        shard_results = parse_zips_parallel(
+            zip_paths, shard_dir, workers=workers, progress=_on_shard
+        )
+
+        click.echo("Merging per-worker shards into canonical Parquet outputs...")
+        merge_shards_to_parquet(
+            [r.paths.main for r in shard_results], paths.main_parquet, ABN_MAIN_SCHEMA
+        )
+        merge_shards_to_parquet(
+            [r.paths.trading for r in shard_results],
+            paths.trading_parquet,
+            ABN_TRADING_NAMES_SCHEMA,
+        )
+        merge_shards_to_parquet(
+            [r.paths.dgr for r in shard_results], paths.dgr_parquet, ABN_DGR_SCHEMA
+        )
+
+        click.echo("Materialising SQLite from merged Parquet...")
+        counts = build_sqlite_from_parquet(
+            paths.main_parquet,
+            paths.trading_parquet,
+            paths.dgr_parquet,
+            paths.sqlite_db,
+        )
+    else:
+        click.echo("Parsing and writing artefacts (single-process)...")
+        done_early = False
+        with WriterBundle(paths) as wb:
+            for dr in download_results:
+                if done_early:
+                    break
+                with zipfile.ZipFile(dr.path) as z:
+                    for info in z.infolist():
+                        if done_early:
+                            break
+                        if not info.filename.endswith(".xml"):
+                            continue
+                        click.echo(f"  parsing {info.filename}...")
+                        with z.open(info) as f:
+                            for record in parse_records(f):
+                                wb.write(record)
+                                if truncated and wb.counts.main >= max_records:
+                                    done_early = True
+                                    break
+        counts = wb.counts
+
     click.echo(
         f"  rows: main={counts.main:,} trading={counts.trading:,} dgr={counts.dgr:,}"
     )
