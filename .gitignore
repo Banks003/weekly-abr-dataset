@@ -29,6 +29,11 @@ outputs/
 .env.local
 *.log
 
+# Worker (Cloudflare)
+worker/node_modules/
+worker/.wrangler/
+worker/dist/
+
 .DS_Store
 Thumbs.db
 .vscode/
