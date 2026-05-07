@@ -68,6 +68,16 @@ uv sync
 uv run abr-extract run --output-dir ./work
 ```
 
+## Prior art and credits
+
+This project stands on shoulders. Specific borrowings:
+
+- **[iangow/abn_lookup](https://github.com/iangow/abn_lookup)** (Ian Gow, Melbourne Business School): the three-table normalisation (main / trading-names / DGR) and most of the snake_case column naming convention (`abn_status`, `abn_status_from_date`, `record_last_updated`, etc.) come directly from his XSLT stylesheets, which remain the most rigorous declarative field-map for the ABR XML. We don't run XSLT at runtime, but his `.xsl` files were used as a schema spec.
+- **[joelkoen/simple-abns](https://github.com/joelkoen/simple-abns)** (Joel Koen): the philosophy of stream-parse-and-flatten into a small, queryable schema is downstream of his Rust pipeline, and his static dataset is what proved the use-case before we built a refresh-on-cadence version. His EntityType enum was a useful reference for the full ~150-code taxonomy.
+- **The ABR's own XSD** (`docs/bulkextract.xsd`, downloaded from data.gov.au) is the authoritative source for the field set and is checked into this repo for reference.
+
+Earlier surveys of the wider ABN tooling ecosystem on GitHub also informed scope decisions — what to deliberately *not* build (no validators, no API wrappers, no scrapers).
+
 ## License
 
 This project is MIT.

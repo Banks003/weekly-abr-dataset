@@ -189,6 +189,10 @@ def parse_records(source: Path | str | IO[bytes]) -> Iterator[RawRecord]:
     strict mode sometimes raises on the ABR feed (the data round-trips through
     stdlib ElementTree without complaint). The caller can inspect lxml's error
     log if any genuine errors arose.
+
+    The streaming + flatten approach is downstream of joelkoen/simple-abns;
+    we use lxml.iterparse with tag filtering instead of his event-based
+    path-stack pattern, but the philosophy is the same.
     """
     context = etree.iterparse(source, events=("end",), tag="ABR", recover=True)
     for _event, elem in context:
