@@ -12,8 +12,47 @@ import time
 import duckdb
 import polars as pl
 
-MAIN_URL = "https://pub-24e45cc5c0384bf1b367427d9777b0a8.r2.dev/abn-main-latest.parquet"
-TRADING_URL = "https://pub-24e45cc5c0384bf1b367427d9777b0a8.r2.dev/abn-trading-names-latest.parquet"
+BASE = "https://pub-24e45cc5c0384bf1b367427d9777b0a8.r2.dev"
+MAIN_URL = f"{BASE}/abn-main-latest.parquet"
+TRADING_URL = f"{BASE}/abn-trading-names-latest.parquet"
+DGR_URL = f"{BASE}/abn-dgr-latest.parquet"
+
+
+def profile_abn(con: duckdb.DuckDBPyConnection, abn: str) -> None:
+    """Reconstruct the full profile for one ABN by querying all three tables."""
+    section(f"Full profile for ABN {abn}")
+    main_q = f"SELECT * FROM read_parquet('{MAIN_URL}') WHERE abn = '{abn}'"
+    trading_q = f"SELECT name, name_type FROM read_parquet('{TRADING_URL}') WHERE abn = '{abn}' ORDER BY name_type, name"
+    dgr_q = f"SELECT dgr_status_from_date, dgr_status, dgr_name FROM read_parquet('{DGR_URL}') WHERE abn = '{abn}'"
+
+    main = con.execute(main_q).to_arrow_table().to_pylist()
+    trading = con.execute(trading_q).to_arrow_table().to_pylist()
+    dgr = con.execute(dgr_q).to_arrow_table().to_pylist()
+
+    if not main:
+        print(f"  ABN {abn} not found")
+        return
+    m = main[0]
+    print(f"  Main name:        {m['main_name']}")
+    if m.get("individual_family_name"):
+        print(f"  Individual:       {m.get('individual_title') or ''} {m.get('individual_given_names') or ''} {m['individual_family_name']}".strip())
+    print(f"  Entity type:      {m['entity_type_text']} ({m['entity_type_ind']})")
+    print(f"  Address:          {m['state'] or '—'} {m['postcode'] or '—'}")
+    print(f"  ASIC:             {m['asic_number'] or '—'} ({m['asic_number_type'] or '—'})")
+    print(f"  ABN status:       {m['abn_status']} from {m['abn_status_from_date']}")
+    print(f"  Last updated:     {m['record_last_updated']}")
+    print(f"  GST:              {m['gst_status'] or '—'} from {m['gst_status_from_date']}")
+    print(f"  Replaced flag:    {m['replaced']}")
+
+    print(f"\n  Trading / business names ({len(trading)}):")
+    for row in trading:
+        print(f"    [{row['name_type']}] {row['name']}")
+
+    print(f"\n  DGR registrations ({len(dgr)}):")
+    for row in dgr:
+        name = row["dgr_name"] or "(no separate fund name — DGR on the main entity)"
+        status = row["dgr_status"] or "(unspecified)"
+        print(f"    {row['dgr_status_from_date']}  [{status}]  {name}")
 
 
 def section(title: str) -> None:
@@ -39,6 +78,10 @@ def run_query(con: duckdb.DuckDBPyConnection, query: str, label: str) -> None:
 def main() -> None:
     con = duckdb.connect()
     con.execute("INSTALL httpfs; LOAD httpfs")
+
+    # Full-profile reconstruction across all three tables, for one ABN.
+    profile_abn(con, "16009661901")  # QANTAS AIRWAYS LIMITED
+    profile_abn(con, "11000047950")  # SYDNEY MISSIONARY & BIBLE COLLEGE — has DGRs
 
     run_query(
         con,
