@@ -61,19 +61,39 @@ def main() -> None:
     help="Skip the Iceberg history step (still publishes snapshot parquets).",
 )
 @click.option("--force", is_flag=True, help="Run even if the source extract is unchanged.")
-def run(output_dir: str, skip_publish: bool, skip_iceberg: bool, force: bool) -> None:
+@click.option(
+    "--max-records",
+    type=int,
+    default=None,
+    help="Truncate parse after N main records — full pipeline test mode. "
+    "Implies test-isolated Iceberg namespace (abr_test) and skips R2 "
+    "snapshot uploads so production artefacts are never overwritten.",
+)
+def run(
+    output_dir: str,
+    skip_publish: bool,
+    skip_iceberg: bool,
+    force: bool,
+    max_records: int | None,
+) -> None:
     """Run the full pipeline: fetch -> download -> parse -> write -> publish."""
     work_dir = Path(output_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
+    truncated = max_records is not None and max_records > 0
 
     catalog = fetch_catalog()
     extract_time_iso = catalog.extract_last_modified.isoformat()
     extract_date = catalog.extract_last_modified.date().isoformat()
     click.echo(f"Catalog: extract {extract_time_iso}")
+    if truncated:
+        click.echo(
+            f"TRUNCATED RUN: max_records={max_records}; iceberg namespace=abr_test; "
+            f"R2 snapshot uploads skipped."
+        )
 
     settings: R2Settings | None = None
     s3 = None
-    if not skip_publish:
+    if not skip_publish and not truncated:
         settings = _load_r2_settings()
         s3 = make_s3_client(settings)
         remote_manifest = read_remote_manifest(s3, settings.bucket)
@@ -93,16 +113,24 @@ def run(output_dir: str, skip_publish: bool, skip_iceberg: bool, force: bool) ->
 
     click.echo("Parsing and writing artefacts...")
     started = datetime.now(UTC)
+    done_early = False
     with WriterBundle(paths) as wb:
         for dr in download_results:
+            if done_early:
+                break
             with zipfile.ZipFile(dr.path) as z:
                 for info in z.infolist():
+                    if done_early:
+                        break
                     if not info.filename.endswith(".xml"):
                         continue
                     click.echo(f"  parsing {info.filename}...")
                     with z.open(info) as f:
                         for record in parse_records(f):
                             wb.write(record)
+                            if truncated and wb.counts.main >= max_records:
+                                done_early = True
+                                break
 
     counts = wb.counts
     click.echo(
@@ -110,12 +138,14 @@ def run(output_dir: str, skip_publish: bool, skip_iceberg: bool, force: bool) ->
     )
 
     iceberg_summary: dict | None = None
-    if not skip_publish and not skip_iceberg:
+    iceberg_ns = "abr_test" if truncated else "abr"
+    if not skip_iceberg:
         iceberg_summary = _run_iceberg_step(
             paths,
             extract_date_iso=extract_date,
+            namespace=iceberg_ns,
         )
-        click.echo(f"Iceberg history step: {iceberg_summary}")
+        click.echo(f"Iceberg history step ({iceberg_ns}): {iceberg_summary}")
 
     manifest = build_manifest(
         paths,
@@ -126,12 +156,17 @@ def run(output_dir: str, skip_publish: bool, skip_iceberg: bool, force: bool) ->
     )
     if iceberg_summary is not None:
         manifest["iceberg"] = iceberg_summary
+        manifest["iceberg_namespace"] = iceberg_ns
+    if truncated:
+        manifest["truncated"] = True
+        manifest["max_records"] = max_records
     manifest_path = work_dir / "manifest.json"
     write_manifest(manifest, manifest_path)
     click.echo(f"Manifest: {manifest_path}")
 
-    if skip_publish:
-        click.echo("--skip-publish set; not uploading.")
+    if skip_publish or truncated:
+        reason = "--skip-publish set" if skip_publish else "truncated run"
+        click.echo(f"{reason}; not uploading snapshot artefacts to R2.")
         return
 
     assert settings is not None and s3 is not None
@@ -141,7 +176,9 @@ def run(output_dir: str, skip_publish: bool, skip_iceberg: bool, force: bool) ->
     click.echo(f"Uploaded {len(plans)} files (each as -latest and -{extract_date}).")
 
 
-def _run_iceberg_step(paths: WriterPaths, *, extract_date_iso: str) -> dict:
+def _run_iceberg_step(
+    paths: WriterPaths, *, extract_date_iso: str, namespace: str = "abr"
+) -> dict:
     """Apply SCD2 update to the three Iceberg history tables on R2 Data Catalog.
 
     Reads each just-written snapshot parquet, reconciles against the prior
@@ -154,7 +191,7 @@ def _run_iceberg_step(paths: WriterPaths, *, extract_date_iso: str) -> dict:
 
     iceberg_settings = load_iceberg_settings_from_env()
     catalog = connect_r2_catalog(iceberg_settings)
-    tables = ensure_history_tables(catalog, namespace=iceberg_settings.namespace)
+    tables = ensure_history_tables(catalog, namespace=namespace)
 
     summary: dict = {}
     for table_key, parquet_path, schema, bootstrap_fn, apply_fn in (

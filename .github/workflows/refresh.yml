@@ -10,6 +10,11 @@ on:
         required: false
         type: boolean
         default: false
+      max_records:
+        description: "Truncate after N main records (test mode; isolated Iceberg namespace, no R2 upload)"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: refresh
@@ -43,4 +48,6 @@ jobs:
           R2_CATALOG_TOKEN: ${{ secrets.R2_CATALOG_TOKEN }}
           R2_BUCKET: weekly-abr-dataset
         run: |
-          uv run abr-extract run --output-dir ./work ${{ inputs.force && '--force' || '' }}
+          uv run abr-extract run --output-dir ./work \
+            ${{ inputs.force && '--force' || '' }} \
+            ${{ inputs.max_records != '' && format('--max-records {0}', inputs.max_records) || '' }}
