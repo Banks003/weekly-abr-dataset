@@ -21,6 +21,7 @@ abr-extract = "abr_extract.cli:main"
 
 [dependency-groups]
 dev = [
+    "duckdb>=1.5.2",
     "moto[s3]>=5.2.0",
     "psutil>=7.2.2",
     "pytest>=8.0.0",
