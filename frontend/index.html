@@ -1,141 +1,439 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ABN search · gazetteer.au</title>
-  <style>
-    :root {
-      --fg: #1a1a1a;
-      --muted: #666;
-      --bg: #fafaf7;
-      --row-alt: #f0f0ed;
-      --accent: #0066cc;
-      --border: #d0d0c8;
-      --bad: #c33;
-      --good: #2a8a2a;
-    }
-    * { box-sizing: border-box; }
-    body {
-      font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-      color: var(--fg); background: var(--bg);
-      margin: 0; padding: 24px;
-      max-width: 1400px; margin-inline: auto;
-    }
-    header { border-bottom: 1px solid var(--border); padding-bottom: 12px; margin-bottom: 16px; }
-    header h1 { margin: 0 0 4px 0; font-size: 22px; font-weight: 600; }
-    header p { margin: 0; color: var(--muted); font-size: 13px; }
-    header a { color: var(--accent); }
-    .controls {
-      display: flex; gap: 8px; flex-wrap: wrap;
-      align-items: center; margin-bottom: 8px;
-    }
-    .controls input, .controls select {
-      padding: 8px 10px; font: inherit; border: 1px solid var(--border);
-      background: white; border-radius: 4px;
-    }
-    .controls input[type=text] { flex: 1 1 320px; min-width: 200px; }
-    .controls select { background: white; }
-    .status { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
-    .status.error { color: var(--bad); }
-    .status.ready { color: var(--good); }
-    table { width: 100%; border-collapse: collapse; background: white; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
-    thead { background: #efefea; }
-    th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
-    th { font-weight: 600; font-size: 13px; color: var(--muted); cursor: default; user-select: none; }
-    tr.expandable { cursor: pointer; }
-    tr.expandable:hover { background: var(--row-alt); }
-    tr.detail { background: #f7f6f0; }
-    tr.detail td { padding: 0 10px 12px 10px; border-bottom: 2px solid var(--border); }
-    .detail-grid {
-      display: grid; grid-template-columns: 200px 1fr; gap: 4px 12px;
-      font-size: 13px; padding: 8px 0;
-    }
-    .detail-grid dt { color: var(--muted); font-weight: 500; }
-    .detail-grid dd { margin: 0; }
-    .pill {
-      display: inline-block; padding: 1px 8px; border-radius: 10px;
-      font-size: 11px; font-weight: 600;
-    }
-    .pill.act { background: #e0f4e0; color: #2a8a2a; }
-    .pill.can { background: #f4e0e0; color: #c33; }
-    .pill.non { background: #eee; color: var(--muted); }
-    .pagination {
-      display: flex; gap: 12px; align-items: center; justify-content: space-between;
-      margin-top: 12px;
-    }
-    .pagination button {
-      padding: 6px 12px; font: inherit; cursor: pointer;
-      background: white; border: 1px solid var(--border); border-radius: 4px;
-    }
-    .pagination button:disabled { opacity: 0.5; cursor: default; }
-    .empty { text-align: center; color: var(--muted); padding: 40px; font-style: italic; }
-    code { background: #efefea; padding: 1px 5px; border-radius: 3px; font-size: 13px; }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Australian Business Register · gazetteer.au</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400;1,8..60,600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper: #f1eadb;
+    --paper-shade: #e8debb;
+    --paper-line: #d8c98f;
+    --ink: #1a1612;
+    --ink-soft: #4a423a;
+    --ink-mute: #7a7066;
+    --gold: #8a6f2a;
+    --gold-soft: #c2a854;
+    --good: #4a6e2a;
+    --bad: #8e3838;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-optical-sizing: auto;
+    font-feature-settings: "onum", "kern";
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    line-height: 1.5;
+    min-height: 100vh;
+    position: relative;
+  }
+
+  /* Paper grain — fixed background SVG noise */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 1;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><filter id='n'><feTurbulence baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.06 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+    mix-blend-mode: multiply;
+  }
+
+  .page {
+    max-width: 1300px;
+    margin: 0 auto;
+    padding: 64px 72px 80px;
+    position: relative;
+    z-index: 2;
+  }
+
+  /* — MASTHEAD ———————————————————————————————— */
+
+  .masthead {
+    border-bottom: 1px solid var(--ink);
+    padding-bottom: 18px;
+    margin-bottom: 32px;
+  }
+
+  .meta-strip {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 10.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--ink-mute);
+    padding-bottom: 14px;
+    margin-bottom: 14px;
+    border-bottom: 1px solid var(--paper-line);
+  }
+  .meta-strip span { white-space: nowrap; }
+  .meta-strip .center { color: var(--gold); font-weight: 500; }
+
+  .masthead h1 {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-weight: 700;
+    font-size: clamp(44px, 6.4vw, 84px);
+    line-height: 0.95;
+    letter-spacing: -0.015em;
+    margin: 0 0 6px;
+    font-feature-settings: "lnum", "kern";
+  }
+  .masthead h1 em {
+    font-style: italic;
+    font-weight: 400;
+    color: var(--gold);
+  }
+
+  .masthead .strapline {
+    font-size: 16px;
+    font-style: italic;
+    color: var(--ink-soft);
+    line-height: 1.55;
+    max-width: 64ch;
+    margin: 14px 0 0;
+  }
+
+  /* — SECTION LABELS ————————————————————————— */
+
+  .section-label {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-variant-caps: all-small-caps;
+    letter-spacing: 0.16em;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--gold);
+    margin: 0 0 10px;
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+  }
+  .section-label::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--paper-line);
+    transform: translateY(-3px);
+  }
+
+  /* — CONTROLS ——————————————————————————————— */
+
+  .controls {
+    display: grid;
+    grid-template-columns: 1.6fr repeat(4, 1fr);
+    gap: 14px;
+    margin-bottom: 28px;
+  }
+
+  .controls input,
+  .controls select {
+    font: inherit;
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 15px;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid var(--paper-line);
+    padding: 9px 4px 7px;
+    color: var(--ink);
+    border-radius: 0;
+    appearance: none;
+    -webkit-appearance: none;
+    transition: border-color 200ms ease;
+  }
+  .controls input:focus,
+  .controls select:focus {
+    outline: none;
+    border-bottom-color: var(--gold);
+  }
+  .controls input::placeholder {
+    color: var(--ink-mute);
+    font-style: italic;
+  }
+  .controls select {
+    cursor: pointer;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'><path fill='%238a6f2a' d='M0 0l6 8 6-8z'/></svg>");
+    background-repeat: no-repeat;
+    background-position: right 4px center;
+    background-size: 9px;
+    padding-right: 22px;
+  }
+
+  /* — STATUS LINE ——————————————————————————— */
+
+  .status {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 11px;
+    letter-spacing: 0.10em;
+    text-transform: uppercase;
+    color: var(--ink-mute);
+    margin: 0 0 14px;
+    height: 14px;
+  }
+  .status.ready { color: var(--good); }
+  .status.error { color: var(--bad); }
+
+  /* — TABLE ——————————————————————————————— */
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-feature-settings: "tnum", "lnum";
+  }
+  thead tr {
+    border-top: 1.5px solid var(--ink);
+    border-bottom: 1px solid var(--ink);
+  }
+  th {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-variant-caps: all-small-caps;
+    letter-spacing: 0.13em;
+    font-size: 11.5px;
+    font-weight: 600;
+    text-align: left;
+    padding: 11px 12px 10px;
+    color: var(--ink-soft);
+  }
+  tbody tr {
+    border-bottom: 1px solid var(--paper-line);
+    transition: background-color 120ms ease;
+  }
+  tbody tr.expandable { cursor: pointer; }
+  tbody tr.expandable:hover { background: var(--paper-shade); }
+  td {
+    padding: 11px 12px;
+    vertical-align: top;
+    font-size: 14.5px;
+  }
+  td.abn {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 13px;
+    letter-spacing: 0.01em;
+    color: var(--ink);
+  }
+  td.muted { color: var(--ink-mute); }
+  td.empty {
+    text-align: center;
+    padding: 60px 0;
+    font-style: italic;
+    color: var(--ink-mute);
+  }
+
+  /* small-caps inline pills, bordered, not filled */
+  .pill {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-variant-caps: all-small-caps;
+    letter-spacing: 0.12em;
+    font-size: 11.5px;
+    font-weight: 600;
+    display: inline-block;
+    padding: 0 6px 1px;
+    border: 1px solid;
+    background: transparent;
+    line-height: 1.3;
+  }
+  .pill.act { color: var(--good); border-color: var(--good); }
+  .pill.can { color: var(--bad); border-color: var(--bad); }
+  .pill.gst { color: var(--gold); border-color: var(--gold); }
+  .pill.non { color: var(--ink-mute); border-color: var(--ink-mute); }
+
+  /* — DETAIL EXPAND ————————————————————————— */
+
+  tr.detail { background: var(--paper-shade); }
+  tr.detail td {
+    padding: 22px 24px;
+    border-bottom: 2px solid var(--gold);
+  }
+  .detail-grid {
+    display: grid;
+    grid-template-columns: 200px 1fr;
+    gap: 8px 22px;
+    font-size: 14px;
+    line-height: 1.55;
+  }
+  .detail-grid dt {
+    font-variant-caps: all-small-caps;
+    letter-spacing: 0.13em;
+    font-size: 11.5px;
+    color: var(--ink-mute);
+    font-weight: 600;
+    padding-top: 3px;
+  }
+  .detail-grid dd { margin: 0; }
+  .detail-grid dd code {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 13px;
+    background: rgba(0,0,0,0.04);
+    padding: 0 4px;
+  }
+
+  /* — PAGINATION ————————————————————————— */
+
+  .pagination {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-top: 32px;
+    padding-top: 16px;
+    border-top: 1px solid var(--paper-line);
+    font-size: 14px;
+    font-style: italic;
+    color: var(--ink-soft);
+  }
+  .pagination button {
+    font: inherit;
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-style: italic;
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--ink);
+    padding: 4px 0;
+    border-bottom: 1px dotted var(--ink-mute);
+    transition: color 200ms ease, border-color 200ms ease;
+  }
+  .pagination button:hover:not(:disabled) {
+    color: var(--gold);
+    border-bottom-color: var(--gold);
+  }
+  .pagination button:disabled {
+    color: var(--ink-mute);
+    cursor: default;
+    border-bottom-color: transparent;
+  }
+
+  /* — COLOPHON ————————————————————————— */
+
+  .colophon {
+    margin-top: 64px;
+    padding-top: 24px;
+    border-top: 1px solid var(--ink);
+    font-size: 13.5px;
+    font-style: italic;
+    color: var(--ink-soft);
+    display: grid;
+    grid-template-columns: 1.2fr 1fr;
+    gap: 32px;
+    line-height: 1.6;
+  }
+  .colophon p { margin: 0 0 10px; }
+  .colophon strong {
+    font-style: normal;
+    font-variant-caps: all-small-caps;
+    letter-spacing: 0.12em;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--ink);
+  }
+  .colophon a {
+    color: var(--ink);
+    text-decoration: none;
+    border-bottom: 1px solid var(--gold);
+    transition: color 200ms ease, border-color 200ms ease;
+  }
+  .colophon a:hover { color: var(--gold); }
+
+  /* — STAGGERED INTRO ————————————————————— */
+
+  @keyframes appear {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: none; }
+  }
+  .masthead         { animation: appear 0.7s 0.05s both ease-out; }
+  .masthead h1      { animation: appear 1.0s 0.15s both ease-out; }
+  .find-section     { animation: appear 0.7s 0.30s both ease-out; }
+  .status, table    { animation: appear 0.7s 0.42s both ease-out; }
+  .colophon         { animation: appear 0.7s 0.55s both ease-out; }
+
+  @media (max-width: 960px) {
+    .page { padding: 40px 24px 60px; }
+    .controls { grid-template-columns: 1fr 1fr; }
+    .colophon { grid-template-columns: 1fr; }
+    .detail-grid { grid-template-columns: 1fr; }
+  }
+
+  @media (max-width: 600px) {
+    .controls { grid-template-columns: 1fr; }
+    .meta-strip { flex-wrap: wrap; gap: 6px 14px; }
+  }
+</style>
 </head>
 <body>
+<div class="page">
 
-<header>
-  <h1>Australian Business Register — searchable</h1>
-  <p>
-    20.16M active &amp; cancelled ABNs · refreshed weekly from
-    <a href="https://data.gov.au/data/dataset/abn-bulk-extract" target="_blank" rel="noopener">data.gov.au</a> ·
-    <a href="https://github.com/Banks003/weekly-abr-dataset" target="_blank" rel="noopener">source</a> ·
-    CC-BY 4.0
-  </p>
+<header class="masthead">
+  <div class="meta-strip">
+    <span>Vol. <span id="vol-no">I</span> · No. <span id="issue-no">1</span></span>
+    <span class="center">Edition of <span id="edition-date">— —</span></span>
+    <span>gazetteer.au · CC-BY 4.0</span>
+  </div>
+  <h1>The Australian <em>Business</em> Register</h1>
+  <p class="strapline">A weekly-refreshed gazetteer of every active and cancelled Australian Business Number, drawn each Sunday from the public bulk extract published by the Australian Business Register on data.gov.au. Type to search; click any row to read the full entry.</p>
 </header>
 
-<div class="controls">
-  <input type="text" id="q" placeholder="Search name, ABN, trading name… (try &quot;qantas&quot;)">
-  <select id="state-filter">
-    <option value="">All states</option>
-    <option>NSW</option><option>VIC</option><option>QLD</option>
-    <option>WA</option><option>SA</option><option>TAS</option>
-    <option>ACT</option><option>NT</option><option>AAT</option>
-  </select>
-  <select id="status-filter">
-    <option value="">All statuses</option>
-    <option value="ACT">Active</option>
-    <option value="CAN">Cancelled</option>
-  </select>
-  <select id="entity-type-filter">
-    <option value="">All entity types</option>
-    <option value="IND">IND — Individual / Sole Trader</option>
-    <option value="PRV">PRV — Australian Private Company</option>
-    <option value="PUB">PUB — Australian Public Company</option>
-    <option value="SMF">SMF — Self-Managed Super Fund</option>
-    <option value="DIT">DIT — Discretionary Investment Trust</option>
-    <option value="DTT">DTT — Discretionary Trading Trust</option>
-    <option value="FPT">FPT — Family Partnership</option>
-    <option value="FUT">FUT — Fixed Unit Trust</option>
-    <option value="STR">STR — Strata-title</option>
-    <option value="OIE">OIE — Other Incorporated Entity</option>
-    <option value="PTR">PTR — Other Partnership</option>
-    <option value="UIE">UIE — Other Unincorporated Entity</option>
-    <option value="DES">DES — Deceased Estate</option>
-    <option value="GOV">GOV — Government</option>
-    <option value="CMT">CMT — Cash Management Trust</option>
-    <option value="LCT">LCT — Listed Public Company</option>
-    <option value="LPT">LPT — Limited Partnership</option>
-    <option value="ARF">ARF — APRA-Regulated Public Sector Fund</option>
-    <option value="NPF">NPF — Non-Profit Fund</option>
-    <option value="POF">POF — Pooled Superannuation Trust</option>
-  </select>
-  <select id="page-size">
-    <option value="20">20 per page</option>
-    <option value="50" selected>50 per page</option>
-    <option value="100">100 per page</option>
-    <option value="200">200 per page</option>
-  </select>
-</div>
+<section class="find-section">
+  <div class="section-label">Find an Entry</div>
+  <div class="controls">
+    <input type="text" id="q" placeholder='by name, ABN, or trading name — try "qantas"'>
+    <select id="state-filter">
+      <option value="">Any state</option>
+      <option>NSW</option><option>VIC</option><option>QLD</option>
+      <option>WA</option><option>SA</option><option>TAS</option>
+      <option>ACT</option><option>NT</option><option>AAT</option>
+    </select>
+    <select id="status-filter">
+      <option value="">Any status</option>
+      <option value="ACT">Active</option>
+      <option value="CAN">Cancelled</option>
+    </select>
+    <select id="entity-type-filter">
+      <option value="">Any entity type</option>
+      <option value="IND">IND — Individual / Sole Trader</option>
+      <option value="PRV">PRV — Australian Private Company</option>
+      <option value="PUB">PUB — Australian Public Company</option>
+      <option value="SMF">SMF — Self-Managed Super Fund</option>
+      <option value="DIT">DIT — Discretionary Investment Trust</option>
+      <option value="DTT">DTT — Discretionary Trading Trust</option>
+      <option value="FPT">FPT — Family Partnership</option>
+      <option value="FUT">FUT — Fixed Unit Trust</option>
+      <option value="STR">STR — Strata-title</option>
+      <option value="OIE">OIE — Other Incorporated Entity</option>
+      <option value="PTR">PTR — Other Partnership</option>
+      <option value="UIE">UIE — Other Unincorporated Entity</option>
+      <option value="DES">DES — Deceased Estate</option>
+      <option value="GOV">GOV — Government</option>
+      <option value="CMT">CMT — Cash Management Trust</option>
+      <option value="LCT">LCT — Listed Public Company</option>
+      <option value="LPT">LPT — Limited Partnership</option>
+      <option value="ARF">ARF — APRA-Regulated Public Sector Fund</option>
+      <option value="NPF">NPF — Non-Profit Fund</option>
+      <option value="POF">POF — Pooled Superannuation Trust</option>
+    </select>
+    <select id="page-size">
+      <option value="20">20 / page</option>
+      <option value="50" selected>50 / page</option>
+      <option value="100">100 / page</option>
+      <option value="200">200 / page</option>
+    </select>
+  </div>
+</section>
 
-<div class="status" id="status">Loading…</div>
+<div class="status" id="status">Preparing…</div>
 
 <table id="results-table" hidden>
   <thead>
     <tr>
       <th>ABN</th>
-      <th>Name</th>
+      <th>Entity</th>
       <th>Type</th>
       <th>State</th>
       <th>Postcode</th>
@@ -152,6 +450,23 @@
   <button id="next">Next →</button>
 </div>
 
+<footer class="colophon">
+  <div>
+    <p>The Australian Business Register is the canonical record of every Australian Business Number issued by the Australian Taxation Office. This gazetteer republishes the weekly bulk extract in a form any modern browser can query directly — no installation, no account, no rate limit.</p>
+    <p>Searches run client-side. Data is fetched on demand from gazetteer.au; nothing about your queries is logged.</p>
+  </div>
+  <div>
+    <p><strong>Source</strong><br>
+    <a href="https://data.gov.au/data/dataset/abn-bulk-extract" target="_blank" rel="noopener">ABN Bulk Extract</a> on data.gov.au, refreshed Sunday afternoons (AEST).</p>
+    <p><strong>Engine</strong><br>
+    <a href="https://github.com/Banks003/weekly-abr-dataset" target="_blank" rel="noopener">weekly-abr-dataset</a> · DuckDB-WASM in browser · Iceberg on R2</p>
+    <p><strong>Licence</strong><br>
+    Bulk data CC-BY 4.0 — attribute "Australian Business Register".</p>
+  </div>
+</footer>
+
+</div>
+
 <script type="module">
   import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm';
 
@@ -162,7 +477,7 @@
 
   const $ = (id) => document.getElementById(id);
   const status = $('status');
-  const rows = $('rows');
+  const rowsEl = $('rows');
   const table = $('results-table');
   const pagination = $('pagination');
   const pageInfo = $('page-info');
@@ -170,19 +485,38 @@
   let db, conn;
   let currentPage = 0;
   let totalRows = 0;
-  let manifestRowCount = null;  // populated from manifest.json on init
+  let manifestRowCount = null;
+
+  const MONTHS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+
+  function formatEditionDate(iso) {
+    if (!iso) return '— —';
+    const d = new Date(iso);
+    return `${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
+  }
+
+  function isoWeekNumber(d) {
+    const t = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+    const dayN = (t.getUTCDay() + 6) % 7;
+    t.setUTCDate(t.getUTCDate() - dayN + 3);
+    const firstThursday = new Date(Date.UTC(t.getUTCFullYear(), 0, 4));
+    return 1 + Math.round(((t - firstThursday) / 86400000 - 3 + ((firstThursday.getUTCDay() + 6) % 7)) / 7);
+  }
 
   async function init() {
     status.textContent = 'Loading dataset metadata…';
-    // Fast: tiny JSON, gives us total row count without scanning parquet.
     try {
       const m = await fetch(`${DATA_BASE}/manifest.json`).then(r => r.json());
       manifestRowCount = m.row_counts?.abn_main ?? null;
+      $('edition-date').textContent = formatEditionDate(m.extract_time);
+      if (m.extract_time) {
+        $('issue-no').textContent = isoWeekNumber(new Date(m.extract_time));
+      }
     } catch (e) {
       console.warn('manifest fetch failed:', e);
     }
 
-    status.textContent = 'Initialising DuckDB-WASM…';
+    status.textContent = 'Initialising query engine…';
     const bundles = duckdb.getJsDelivrBundles();
     const bundle = await duckdb.selectBundle(bundles);
     const worker = await duckdb.createWorker(bundle.mainWorker);
@@ -191,8 +525,11 @@
     await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
     conn = await db.connect();
     await conn.query("INSTALL httpfs; LOAD httpfs;");
+
     status.className = 'status ready';
-    status.textContent = `Ready · data from ${DATA_BASE}`;
+    status.textContent = manifestRowCount
+      ? `Ready · ${manifestRowCount.toLocaleString()} entries on file`
+      : 'Ready';
     await refresh();
   }
 
@@ -205,7 +542,6 @@
     const params = [];
 
     if (q) {
-      // ABN exact match takes priority; otherwise name/trading prefix-or-substring
       if (/^\d{11}$/.test(q.replace(/\s/g, ''))) {
         filters.push('abn = ?');
         params.push(q.replace(/\s/g, ''));
@@ -227,17 +563,13 @@
   }
 
   async function countRows({ where, params }) {
-    const sql = `SELECT COUNT(*) AS n FROM read_parquet('${MAIN_URL}') ${where}`;
-    const stmt = await conn.prepare(sql);
+    const stmt = await conn.prepare(`SELECT COUNT(*) AS n FROM read_parquet('${MAIN_URL}') ${where}`);
     const result = await stmt.query(...params);
     await stmt.close();
     return Number(result.toArray()[0].toJSON().n);
   }
 
   async function fetchPage({ where, params }, offset, limit, filtered) {
-    // ORDER BY abn is expensive on a 20M-row scan. Skip it when no filters
-    // are set — natural Parquet order is fine for "browse all" UX. With any
-    // filter, the result set is much smaller so the sort is cheap.
     const orderBy = filtered ? 'ORDER BY abn' : '';
     const sql = `
       SELECT abn, main_name, individual_title, individual_given_names,
@@ -256,21 +588,10 @@
   }
 
   async function fetchExtras(abn) {
-    const tradingSql = `
-      SELECT name, name_type
-      FROM read_parquet('${TRADING_URL}')
-      WHERE abn = ?
-      ORDER BY name_type, name
-    `;
-    const dgrSql = `
-      SELECT dgr_status_from_date AS "from", dgr_status, dgr_name
-      FROM read_parquet('${DGR_URL}')
-      WHERE abn = ?
-    `;
-    const tStmt = await conn.prepare(tradingSql);
+    const tStmt = await conn.prepare(`SELECT name, name_type FROM read_parquet('${TRADING_URL}') WHERE abn = ? ORDER BY name_type, name`);
     const trading = (await tStmt.query(abn)).toArray().map(r => r.toJSON());
     await tStmt.close();
-    const dStmt = await conn.prepare(dgrSql);
+    const dStmt = await conn.prepare(`SELECT dgr_status_from_date AS "from", dgr_status, dgr_name FROM read_parquet('${DGR_URL}') WHERE abn = ?`);
     const dgr = (await dStmt.query(abn)).toArray().map(r => r.toJSON());
     await dStmt.close();
     return { trading, dgr };
@@ -281,44 +602,43 @@
       return [row.individual_title, row.individual_given_names, row.individual_family_name]
         .filter(Boolean).join(' ');
     }
-    return row.main_name ?? '';
+    return row.main_name ?? '—';
+  }
+
+  function escapeHtml(s) {
+    return String(s ?? '').replace(/[&<>"']/g, (c) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   }
 
   function renderRows(records) {
-    rows.innerHTML = '';
+    rowsEl.innerHTML = '';
     if (!records.length) {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td colspan="7" class="empty">No matches.</td>`;
-      rows.appendChild(tr);
+      tr.innerHTML = `<td colspan="7" class="empty">No entries matching this query.</td>`;
+      rowsEl.appendChild(tr);
       return;
     }
     for (const r of records) {
       const tr = document.createElement('tr');
       tr.className = 'expandable';
-      tr.dataset.abn = r.abn;
-      const status = r.abn_status === 'ACT'
+      const statusPill = r.abn_status === 'ACT'
         ? '<span class="pill act">Active</span>'
         : '<span class="pill can">Cancelled</span>';
-      const gst = r.gst_status === 'ACT'
-        ? '<span class="pill act">GST</span>'
+      const gstPill = r.gst_status === 'ACT'
+        ? '<span class="pill gst">GST</span>'
         : (r.gst_status ? `<span class="pill non">${r.gst_status}</span>` : '');
       tr.innerHTML = `
-        <td><code>${r.abn}</code></td>
-        <td>${escape(nameFor(r))}</td>
-        <td>${escape(r.entity_type_text ?? '')}</td>
+        <td class="abn">${r.abn}</td>
+        <td>${escapeHtml(nameFor(r))}</td>
+        <td class="muted">${escapeHtml(r.entity_type_text ?? '')}</td>
         <td>${r.state ?? ''}</td>
-        <td>${r.postcode ?? ''}</td>
-        <td>${status}</td>
-        <td>${gst}</td>
+        <td class="muted">${r.postcode ?? ''}</td>
+        <td>${statusPill}</td>
+        <td>${gstPill}</td>
       `;
       tr.addEventListener('click', () => toggleDetail(tr, r));
-      rows.appendChild(tr);
+      rowsEl.appendChild(tr);
     }
-  }
-
-  function escape(s) {
-    return String(s).replace(/[&<>"']/g, (c) =>
-      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   }
 
   async function toggleDetail(tr, row) {
@@ -331,7 +651,7 @@
     const detail = document.createElement('tr');
     detail.className = 'detail';
     detail.dataset.for = row.abn;
-    detail.innerHTML = `<td colspan="7"><dl class="detail-grid"><dt>Loading…</dt><dd></dd></dl></td>`;
+    detail.innerHTML = `<td colspan="7"><dl class="detail-grid"><dt>Loading</dt><dd>fetching trading names &amp; DGR endorsements…</dd></dl></td>`;
     tr.parentNode.insertBefore(detail, tr.nextSibling);
 
     const { trading, dgr } = await fetchExtras(row.abn);
@@ -339,26 +659,26 @@
     grid.innerHTML = '';
     const add = (k, v) => {
       const dt = document.createElement('dt'); dt.textContent = k;
-      const dd = document.createElement('dd'); dd.innerHTML = v ?? '';
+      const dd = document.createElement('dd'); dd.innerHTML = v ?? '—';
       grid.appendChild(dt); grid.appendChild(dd);
     };
-    add('Main name', escape(row.main_name ?? '(individual)'));
+    add('Main name', escapeHtml(row.main_name ?? '(individual)'));
     if (row.entity_kind === 'legal') {
-      add('Individual', escape(nameFor(row)));
+      add('Individual', escapeHtml(nameFor(row)));
     }
-    add('Entity type', `${escape(row.entity_type_text ?? '')} (<code>${row.entity_type_ind ?? ''}</code>)`);
-    add('Address', `${row.state ?? '—'} ${row.postcode ?? '—'}`);
+    add('Entity type', `${escapeHtml(row.entity_type_text ?? '')} <code>${row.entity_type_ind ?? ''}</code>`);
+    add('Address', `${row.state ?? '—'} &nbsp; ${row.postcode ?? '—'}`);
     add('ABN', `<code>${row.abn}</code>`);
     add('ASIC / ACN', row.asic_number ? `<code>${row.asic_number}</code>` : '—');
     add('ABN status', row.abn_status ?? '—');
     add('GST status', row.gst_status ?? '—');
     if (trading.length) {
-      const list = trading.map((t) => `${escape(t.name)} <code>[${t.name_type}]</code>`).join('<br>');
-      add(`Trading / business names (${trading.length})`, list);
+      const list = trading.map((t) => `${escapeHtml(t.name)} <code>${t.name_type}</code>`).join('<br>');
+      add(`Trading names (${trading.length})`, list);
     }
     if (dgr.length) {
       const list = dgr.map((d) =>
-        `${d.from ?? ''} [${d.dgr_status ?? '—'}] ${escape(d.dgr_name ?? '(applies to main entity)')}`
+        `${d.from ?? ''} <code>${d.dgr_status ?? '—'}</code> ${escapeHtml(d.dgr_name ?? '(applies to main entity)')}`
       ).join('<br>');
       add(`DGR endorsements (${dgr.length})`, list);
     }
@@ -368,39 +688,37 @@
     const pageSize = Number($('page-size').value);
     const filterSpec = buildWhere();
     const filtered = filterSpec.params.length > 0;
-    table.hidden = true; pagination.hidden = true;
+    table.hidden = true;
+    pagination.hidden = true;
     status.className = 'status';
     status.textContent = filtered ? 'Filtering…' : 'Loading first page…';
     try {
-      // Show the page first (fast), then update totals (slower, async).
       const records = await fetchPage(filterSpec, currentPage * pageSize, pageSize, filtered);
       renderRows(records);
       table.hidden = false;
       pagination.hidden = false;
 
-      // Initial totals from manifest if no filter; otherwise actual count.
       if (!filtered && manifestRowCount !== null) {
         totalRows = manifestRowCount;
         const totalPages = Math.ceil(totalRows / pageSize);
-        pageInfo.textContent = `Page ${(currentPage + 1).toLocaleString()} of ${totalPages.toLocaleString()} · ${totalRows.toLocaleString()} total`;
+        pageInfo.innerHTML = `Page ${(currentPage + 1).toLocaleString()} of ${totalPages.toLocaleString()} &nbsp;·&nbsp; ${totalRows.toLocaleString()} entries`;
         $('prev').disabled = currentPage === 0;
         $('next').disabled = (currentPage + 1) >= totalPages;
         status.className = 'status ready';
-        status.textContent = `Ready · ${totalRows.toLocaleString()} ABNs`;
+        status.textContent = `Ready · ${totalRows.toLocaleString()} entries on file`;
         return;
       }
 
-      // For filtered queries we need an actual count.
-      pageInfo.textContent = `Page ${(currentPage + 1).toLocaleString()} · counting…`;
+      pageInfo.innerHTML = `Page ${(currentPage + 1).toLocaleString()} &nbsp;·&nbsp; <em>counting matches…</em>`;
       $('prev').disabled = currentPage === 0;
-      $('next').disabled = records.length < pageSize;  // optimistic until count returns
+      $('next').disabled = records.length < pageSize;
       status.className = 'status';
       status.textContent = 'Counting matches…';
 
       totalRows = await countRows(filterSpec);
       const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
       if (currentPage >= totalPages) currentPage = 0;
-      pageInfo.textContent = `Page ${(currentPage + 1).toLocaleString()} of ${totalPages.toLocaleString()} · ${totalRows.toLocaleString()} matches`;
+      pageInfo.innerHTML = `Page ${(currentPage + 1).toLocaleString()} of ${totalPages.toLocaleString()} &nbsp;·&nbsp; ${totalRows.toLocaleString()} matches`;
       $('prev').disabled = currentPage === 0;
       $('next').disabled = (currentPage + 1) >= totalPages;
       status.className = 'status ready';
@@ -412,7 +730,6 @@
     }
   }
 
-  // Debounce input changes
   let debounceTimer = null;
   function debouncedRefresh() {
     clearTimeout(debounceTimer);
