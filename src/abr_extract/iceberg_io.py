@@ -219,3 +219,61 @@ def update_history_table(
         "closed_rows": history.height - open_rows,
         "bootstrap": prev.height == 0,
     }
+
+
+# Iceberg snapshot manifest (M10) -----------------------------------------------
+
+def _s3_to_public_url(s3_path: str, bucket: str, public_base_url: str) -> str:
+    """Translate an Iceberg data-file ``s3://<bucket>/...`` path to the public CDN URL."""
+    s3_prefix = f"s3://{bucket}/"
+    if s3_path.startswith(s3_prefix):
+        return public_base_url.rstrip("/") + "/" + s3_path[len(s3_prefix):]
+    return s3_path
+
+
+def build_snapshot_manifest(
+    tables: dict[str, Table],
+    *,
+    namespace: str,
+    generated_at: str,
+    extract_time: str,
+    bucket: str,
+    public_base_url: str,
+) -> dict:
+    """Build the ``iceberg-snapshot.json`` payload for a set of history tables.
+
+    For each table this enumerates the live data files via
+    ``table.scan().plan_files()``, translates ``s3://`` paths to public URLs,
+    sums the per-file ``record_count`` for a row total, and records the
+    current snapshot id.
+
+    The frontend consumes this so it can read DuckDB-WASM ``read_parquet``
+    against the live Iceberg data files. ``current_view_filter`` tells the
+    UI which SCD2 clause to apply for the "currently valid" view of each
+    history relation (``valid_to IS NULL``).
+    """
+    out: dict = {
+        "generated_at": generated_at,
+        "iceberg_namespace": namespace,
+        "extract_time": extract_time,
+        "tables": {},
+    }
+    for table_name, table in tables.items():
+        table.refresh()
+        snap = table.current_snapshot()
+        snap_id = snap.snapshot_id if snap is not None else None
+
+        plan = list(table.scan().plan_files())
+        urls: list[str] = []
+        row_count = 0
+        for task in plan:
+            urls.append(_s3_to_public_url(task.file.file_path, bucket, public_base_url))
+            row_count += int(task.file.record_count or 0)
+
+        out["tables"][table_name] = {
+            "snapshot_id": snap_id,
+            "data_files": urls,
+            "row_count": row_count,
+            "current_view_filter": "valid_to IS NULL",
+        }
+    return out

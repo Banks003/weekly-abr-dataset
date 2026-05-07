@@ -471,9 +471,23 @@
   import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm';
 
   const DATA_BASE = 'https://gazetteer.au';
-  const MAIN_URL = `${DATA_BASE}/abn-main-latest.parquet`;
-  const TRADING_URL = `${DATA_BASE}/abn-trading-names-latest.parquet`;
-  const DGR_URL = `${DATA_BASE}/abn-dgr-latest.parquet`;
+  // Iceberg snapshot manifest — fetched on init and used to build the
+  // read_parquet([...]) source for each relation. Replaces the legacy
+  // -latest.parquet uploads (which are now frozen at the 2026-05-05 snapshot).
+  let MAIN_SOURCE = '';
+  let TRADING_SOURCE = '';
+  let DGR_SOURCE = '';
+  // SCD2 filter applied to every read of the history tables so only the
+  // currently-valid row per ABN is visible to the UI.
+  const CURRENT = 'valid_to IS NULL';
+
+  function parquetSource(urls) {
+    if (!urls || urls.length === 0) {
+      throw new Error('No data files in iceberg-snapshot.json — has the pipeline run yet?');
+    }
+    const list = urls.map(u => `'${u}'`).join(',');
+    return `read_parquet([${list}])`;
+  }
 
   const $ = (id) => document.getElementById(id);
   const status = $('status');
@@ -506,14 +520,22 @@
   async function init() {
     status.textContent = 'Loading dataset metadata…';
     try {
-      const m = await fetch(`${DATA_BASE}/manifest.json`).then(r => r.json());
-      manifestRowCount = m.row_counts?.abn_main ?? null;
-      $('edition-date').textContent = formatEditionDate(m.extract_time);
-      if (m.extract_time) {
-        $('issue-no').textContent = isoWeekNumber(new Date(m.extract_time));
+      // M11: read directly from the Iceberg snapshot manifest. The pipeline
+      // (cli.py via build_snapshot_manifest) writes this after each refresh.
+      const snap = await fetch(`${DATA_BASE}/iceberg-snapshot.json`).then(r => r.json());
+      MAIN_SOURCE = parquetSource(snap.tables.abn_main_history.data_files);
+      TRADING_SOURCE = parquetSource(snap.tables.abn_trading_names_history.data_files);
+      DGR_SOURCE = parquetSource(snap.tables.abn_dgr_history.data_files);
+      manifestRowCount = snap.tables.abn_main_history.row_count ?? null;
+      $('edition-date').textContent = formatEditionDate(snap.extract_time);
+      if (snap.extract_time) {
+        $('issue-no').textContent = isoWeekNumber(new Date(snap.extract_time));
       }
     } catch (e) {
-      console.warn('manifest fetch failed:', e);
+      console.warn('iceberg-snapshot.json fetch failed:', e);
+      status.className = 'status error';
+      status.textContent = `Couldn't load iceberg-snapshot.json — the dataset may not have been published yet.`;
+      throw e;
     }
 
     status.textContent = 'Initialising query engine…';
@@ -541,6 +563,9 @@
     const filters = [];
     const params = [];
 
+    // SCD2 filter is implicit on the main relation (added at the call site
+    // in countRows / fetchPage), but the trading-names sub-query also needs
+    // it so we don't surface trading-name hits from previous snapshots.
     if (q) {
       if (/^\d{11}$/.test(q.replace(/\s/g, ''))) {
         filters.push('abn = ?');
@@ -551,7 +576,7 @@
           main_name ILIKE ?
           OR individual_family_name ILIKE ?
           OR individual_given_names ILIKE ?
-          OR abn IN (SELECT abn FROM read_parquet('${TRADING_URL}') WHERE name ILIKE ?)
+          OR abn IN (SELECT abn FROM ${TRADING_SOURCE} WHERE ${CURRENT} AND name ILIKE ?)
         )`);
         params.push(pat, pat, pat, pat);
       }
@@ -563,7 +588,8 @@
   }
 
   async function countRows({ where, params }) {
-    const stmt = await conn.prepare(`SELECT COUNT(*) AS n FROM read_parquet('${MAIN_URL}') ${where}`);
+    const wherePlus = where ? `${where} AND ${CURRENT}` : `WHERE ${CURRENT}`;
+    const stmt = await conn.prepare(`SELECT COUNT(*) AS n FROM ${MAIN_SOURCE} ${wherePlus}`);
     const result = await stmt.query(...params);
     await stmt.close();
     return Number(result.toArray()[0].toJSON().n);
@@ -571,13 +597,14 @@
 
   async function fetchPage({ where, params }, offset, limit, filtered) {
     const orderBy = filtered ? 'ORDER BY abn' : '';
+    const wherePlus = where ? `${where} AND ${CURRENT}` : `WHERE ${CURRENT}`;
     const sql = `
       SELECT abn, main_name, individual_title, individual_given_names,
              individual_family_name, entity_kind, entity_type_ind,
              entity_type_text, state, postcode, abn_status,
              gst_status, asic_number
-      FROM read_parquet('${MAIN_URL}')
-      ${where}
+      FROM ${MAIN_SOURCE}
+      ${wherePlus}
       ${orderBy}
       LIMIT ? OFFSET ?
     `;
@@ -588,10 +615,10 @@
   }
 
   async function fetchExtras(abn) {
-    const tStmt = await conn.prepare(`SELECT name, name_type FROM read_parquet('${TRADING_URL}') WHERE abn = ? ORDER BY name_type, name`);
+    const tStmt = await conn.prepare(`SELECT name, name_type FROM ${TRADING_SOURCE} WHERE ${CURRENT} AND abn = ? ORDER BY name_type, name`);
     const trading = (await tStmt.query(abn)).toArray().map(r => r.toJSON());
     await tStmt.close();
-    const dStmt = await conn.prepare(`SELECT dgr_status_from_date AS "from", dgr_status, dgr_name FROM read_parquet('${DGR_URL}') WHERE abn = ?`);
+    const dStmt = await conn.prepare(`SELECT dgr_status_from_date AS "from", dgr_status, dgr_name FROM ${DGR_SOURCE} WHERE ${CURRENT} AND abn = ?`);
     const dgr = (await dStmt.query(abn)).toArray().map(r => r.toJSON());
     await dStmt.close();
     return { trading, dgr };

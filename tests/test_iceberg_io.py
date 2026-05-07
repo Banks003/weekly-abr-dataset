@@ -188,3 +188,76 @@ def test_table_schemas_dict_is_exhaustive():
         "abn_trading_names_history",
         "abn_dgr_history",
     }
+
+
+# Snapshot manifest (M10) ---------------------------------------------------
+
+from abr_extract.iceberg_io import (  # noqa: E402
+    _s3_to_public_url,
+    build_snapshot_manifest,
+)
+
+
+def test_s3_to_public_url_translates_warehouse_paths():
+    out = _s3_to_public_url(
+        "s3://weekly-abr-dataset/iceberg/abr/abn_main_history/data/00000-0.parquet",
+        bucket="weekly-abr-dataset",
+        public_base_url="https://gazetteer.au",
+    )
+    assert out == (
+        "https://gazetteer.au/iceberg/abr/abn_main_history/data/00000-0.parquet"
+    )
+
+
+def test_s3_to_public_url_passes_through_unrelated_paths():
+    out = _s3_to_public_url(
+        "https://example.com/some.parquet",
+        bucket="weekly-abr-dataset",
+        public_base_url="https://gazetteer.au",
+    )
+    assert out == "https://example.com/some.parquet"
+
+
+def test_build_snapshot_manifest_lists_tables_with_data_files(tables):
+    """After bootstrapping a history table, the manifest should list its
+    data file URLs, snapshot id, and a non-zero row count."""
+    main = pl.DataFrame([_main_row()], schema={
+        "abn": pl.Utf8, "abn_status": pl.Utf8, "abn_status_from_date": pl.Date,
+        "record_last_updated": pl.Date, "replaced": pl.Utf8,
+        "entity_type_ind": pl.Utf8, "entity_type_text": pl.Utf8,
+        "entity_kind": pl.Utf8, "main_name": pl.Utf8, "main_name_type": pl.Utf8,
+        "individual_title": pl.Utf8, "individual_given_names": pl.Utf8,
+        "individual_family_name": pl.Utf8, "individual_name_type": pl.Utf8,
+        "state": pl.Utf8, "postcode": pl.Utf8, "asic_number": pl.Utf8,
+        "asic_number_type": pl.Utf8, "gst_status": pl.Utf8,
+        "gst_status_from_date": pl.Date,
+    })
+    history = bootstrap_main(main, date(2026, 5, 5))
+    write_history(tables["abn_main_history"], history, schema=ABN_MAIN_HISTORY_SCHEMA)
+
+    out = build_snapshot_manifest(
+        tables,
+        namespace="abr_test",
+        generated_at="2026-05-05T04:15:00Z",
+        extract_time="2026-05-05T03:00:00Z",
+        bucket="weekly-abr-dataset",
+        public_base_url="https://gazetteer.au",
+    )
+
+    assert out["iceberg_namespace"] == "abr_test"
+    assert out["generated_at"] == "2026-05-05T04:15:00Z"
+    assert out["extract_time"] == "2026-05-05T03:00:00Z"
+    main_block = out["tables"]["abn_main_history"]
+    assert main_block["row_count"] == 1
+    assert main_block["snapshot_id"] is not None
+    assert main_block["current_view_filter"] == "valid_to IS NULL"
+    assert len(main_block["data_files"]) >= 1
+    # Local catalog uses file:// URLs — no s3:// prefix to translate.
+    # In production the URLs would start with https://gazetteer.au/...
+    for url in main_block["data_files"]:
+        assert url.endswith(".parquet")
+
+    # Tables that were never written to should still appear, with no data files.
+    trading_block = out["tables"]["abn_trading_names_history"]
+    assert trading_block["row_count"] == 0
+    assert trading_block["data_files"] == []
