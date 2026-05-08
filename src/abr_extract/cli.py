@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 import zipfile
 from datetime import UTC, date, datetime
@@ -48,7 +49,60 @@ from .schema import (
     ABN_MAIN_SCHEMA,
     ABN_TRADING_NAMES_SCHEMA,
 )
+from .search_index import build_search_index
 from .write import WriterBundle, WriterPaths, build_manifest, write_manifest
+
+
+class _Stage:
+    """Stage marker context manager for the pipeline.
+
+    Prints ``[stage] <name> starting (rss=X GB)`` on entry and
+    ``[stage] <name> done in Ns (rss=Y GB)`` on clean exit, or
+    ``[stage] <name> FAILED after Ns ...`` on exception. Output goes to
+    stderr so it interleaves cleanly with the regular stdout chatter.
+
+    The whole point is that the *last printed line* before any silent
+    SIGKILL identifies which stage owned the failure.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.start = 0.0
+
+    def _rss_gb(self) -> str:
+        # Linux ru_maxrss is in KB; CI runner is Linux. Falls back to
+        # "?" on any error — diagnostic plumbing must never mask the
+        # real failure.
+        try:
+            import resource
+
+            kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            return f"{kb / 1e6:.2f} GB"
+        except Exception:
+            return "?"
+
+    def __enter__(self) -> _Stage:
+        self.start = time.monotonic()
+        click.echo(f"[stage] {self.name} starting (rss={self._rss_gb()})", err=True)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        duration = time.monotonic() - self.start
+        if exc_type is None:
+            click.echo(
+                f"[stage] {self.name} done in {duration:.1f}s (rss={self._rss_gb()})",
+                err=True,
+            )
+        else:
+            click.echo(
+                f"[stage] {self.name} FAILED after {duration:.1f}s "
+                f"(rss={self._rss_gb()}): {exc_type.__name__}",
+                err=True,
+            )
+
+
+def _stage(name: str) -> _Stage:
+    return _Stage(name)
 
 
 @click.group()
@@ -124,8 +178,8 @@ def run(
             click.echo("Remote manifest already at this extract — nothing to do.")
             return
 
-    click.echo("Downloading source zips...")
-    download_results = download_all(catalog, work_dir)
+    with _stage("download"):
+        download_results = download_all(catalog, work_dir)
 
     paths = WriterPaths(
         main_parquet=work_dir / "abn_main.parquet",
@@ -137,7 +191,6 @@ def run(
     started = datetime.now(UTC)
     use_parallel = workers > 1 and not truncated
     if use_parallel:
-        click.echo(f"Parsing in parallel ({workers} workers)...")
         shard_dir = work_dir / "shards"
         zip_paths = [dr.path for dr in download_results]
 
@@ -148,22 +201,23 @@ def run(
                 f"dgr={result.counts.dgr:,})"
             )
 
-        shard_results = parse_zips_parallel(
-            zip_paths, shard_dir, workers=workers, progress=_on_shard
-        )
+        with _stage(f"parse (parallel, {workers} workers)"):
+            shard_results = parse_zips_parallel(
+                zip_paths, shard_dir, workers=workers, progress=_on_shard
+            )
 
-        click.echo("Merging per-worker shards into canonical Parquet outputs...")
-        merge_shards_to_parquet(
-            [r.paths.main for r in shard_results], paths.main_parquet, ABN_MAIN_SCHEMA
-        )
-        merge_shards_to_parquet(
-            [r.paths.trading for r in shard_results],
-            paths.trading_parquet,
-            ABN_TRADING_NAMES_SCHEMA,
-        )
-        merge_shards_to_parquet(
-            [r.paths.dgr for r in shard_results], paths.dgr_parquet, ABN_DGR_SCHEMA
-        )
+        with _stage("merge shards"):
+            merge_shards_to_parquet(
+                [r.paths.main for r in shard_results], paths.main_parquet, ABN_MAIN_SCHEMA
+            )
+            merge_shards_to_parquet(
+                [r.paths.trading for r in shard_results],
+                paths.trading_parquet,
+                ABN_TRADING_NAMES_SCHEMA,
+            )
+            merge_shards_to_parquet(
+                [r.paths.dgr for r in shard_results], paths.dgr_parquet, ABN_DGR_SCHEMA
+            )
         # Free the intermediate per-worker shards (~1.4GB) so the Iceberg
         # step has clean disk + page-cache headroom.
         import contextlib as _ctx
@@ -184,39 +238,47 @@ def run(
             dgr=_pq_meta(paths.dgr_parquet).num_rows,
         )
     else:
-        click.echo("Parsing and writing artefacts (single-process)...")
-        done_early = False
-        with WriterBundle(paths) as wb:
-            for dr in download_results:
-                if done_early:
-                    break
-                with zipfile.ZipFile(dr.path) as z:
-                    for info in z.infolist():
-                        if done_early:
-                            break
-                        if not info.filename.endswith(".xml"):
-                            continue
-                        click.echo(f"  parsing {info.filename}...")
-                        with z.open(info) as f:
-                            for record in parse_records(f):
-                                wb.write(record)
-                                if truncated and wb.counts.main >= max_records:
-                                    done_early = True
-                                    break
-        counts = wb.counts
+        with _stage("parse (single-process)"):
+            done_early = False
+            with WriterBundle(paths) as wb:
+                for dr in download_results:
+                    if done_early:
+                        break
+                    with zipfile.ZipFile(dr.path) as z:
+                        for info in z.infolist():
+                            if done_early:
+                                break
+                            if not info.filename.endswith(".xml"):
+                                continue
+                            click.echo(f"  parsing {info.filename}...")
+                            with z.open(info) as f:
+                                for record in parse_records(f):
+                                    wb.write(record)
+                                    if truncated and wb.counts.main >= max_records:
+                                        done_early = True
+                                        break
+            counts = wb.counts
 
     click.echo(
         f"  rows: main={counts.main:,} trading={counts.trading:,} dgr={counts.dgr:,}"
     )
 
+    search_index_path = work_dir / "abn-search.parquet"
+    with _stage("build search index"):
+        search_rows = build_search_index(
+            paths.main_parquet, paths.trading_parquet, search_index_path
+        )
+        click.echo(f"  search index: {search_rows:,} rows -> {search_index_path}")
+
     iceberg_summary: dict | None = None
     iceberg_ns = "abr_test" if truncated else "abr"
     if not skip_iceberg:
-        iceberg_summary = _run_iceberg_step(
-            paths,
-            extract_date_iso=extract_date,
-            namespace=iceberg_ns,
-        )
+        with _stage(f"iceberg ({iceberg_ns})"):
+            iceberg_summary = _run_iceberg_step(
+                paths,
+                extract_date_iso=extract_date,
+                namespace=iceberg_ns,
+            )
         click.echo(f"Iceberg history step ({iceberg_ns}): {iceberg_summary}")
 
     # Build SQLite after Iceberg so the heavy iceberg history reconciliation
@@ -224,13 +286,13 @@ def run(
     # earlier (no full read), so we don't need WriterBundle to have written
     # SQLite to know the row counts.
     if use_parallel:
-        click.echo("Materialising SQLite from merged Parquet (post-Iceberg)...")
-        build_sqlite_from_parquet(
-            paths.main_parquet,
-            paths.trading_parquet,
-            paths.dgr_parquet,
-            paths.sqlite_db,
-        )
+        with _stage("sqlite materialisation"):
+            build_sqlite_from_parquet(
+                paths.main_parquet,
+                paths.trading_parquet,
+                paths.dgr_parquet,
+                paths.sqlite_db,
+            )
 
     iceberg_snapshot_manifest: dict | None = None
     if not skip_iceberg:
@@ -241,20 +303,21 @@ def run(
                 "R2_BUCKET", "weekly-abr-dataset"
             )
         )
-        iceberg_snapshot_manifest = _build_iceberg_snapshot_manifest(
-            namespace=iceberg_ns,
-            generated_at=started.isoformat().replace("+00:00", "Z"),
-            extract_time=extract_time_iso,
-            bucket=iceberg_bucket,
-        )
-        # Always write the local copy so we can inspect runs that
-        # skipped publish.
-        snap_path = work_dir / "iceberg-snapshot.json"
-        snap_path.write_text(
-            json.dumps(iceberg_snapshot_manifest, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        click.echo(f"Iceberg snapshot manifest: {snap_path}")
+        with _stage("iceberg-snapshot manifest"):
+            iceberg_snapshot_manifest = _build_iceberg_snapshot_manifest(
+                namespace=iceberg_ns,
+                generated_at=started.isoformat().replace("+00:00", "Z"),
+                extract_time=extract_time_iso,
+                bucket=iceberg_bucket,
+            )
+            # Always write the local copy so we can inspect runs that
+            # skipped publish.
+            snap_path = work_dir / "iceberg-snapshot.json"
+            snap_path.write_text(
+                json.dumps(iceberg_snapshot_manifest, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            click.echo(f"Iceberg snapshot manifest: {snap_path}")
 
     manifest = build_manifest(
         paths,
@@ -268,6 +331,9 @@ def run(
         manifest["iceberg_namespace"] = iceberg_ns
     if iceberg_snapshot_manifest is not None:
         manifest["iceberg_snapshot_url"] = f"{public_base_url_for(settings)}/iceberg-snapshot.json"
+        iceberg_snapshot_manifest["search_index_url"] = (
+            f"{public_base_url_for(settings)}/abn-search-latest.parquet"
+        )
     if truncated:
         manifest["truncated"] = True
         manifest["max_records"] = max_records
@@ -281,28 +347,47 @@ def run(
         return
 
     assert settings is not None and s3 is not None
-    click.echo(f"Uploading to R2 bucket '{settings.bucket}'...")
-    plans = plan_uploads(work_dir, extract_date=extract_date)
-    upload_all(s3, settings.bucket, plans)
-    if iceberg_snapshot_manifest is not None:
-        snap_body = json.dumps(
-            iceberg_snapshot_manifest, indent=2, sort_keys=True
-        ).encode("utf-8")
-        for key in (
-            "iceberg-snapshot.json",
-            f"iceberg-snapshot-{extract_date}.json",
-        ):
-            s3.put_object(
-                Bucket=settings.bucket,
-                Key=key,
-                Body=snap_body,
-                ContentType="application/json",
+    with _stage(f"upload to R2 ({settings.bucket})"):
+        plans = plan_uploads(work_dir, extract_date=extract_date)
+        upload_all(s3, settings.bucket, plans)
+        # Search index — uploaded as -latest and a dated copy alongside
+        # the manifest. Keeps the same versioning convention.
+        if search_index_path.exists():
+            with search_index_path.open("rb") as f:
+                search_body = f.read()
+            for key in (
+                "abn-search-latest.parquet",
+                f"abn-search-{extract_date}.parquet",
+            ):
+                s3.put_object(
+                    Bucket=settings.bucket,
+                    Key=key,
+                    Body=search_body,
+                    ContentType="application/vnd.apache.parquet",
+                )
+            click.echo(
+                f"Uploaded search index ({len(search_body):,} bytes) to "
+                f"{public_base_url_for(settings)}/abn-search-latest.parquet"
             )
-        click.echo(
-            f"Uploaded iceberg-snapshot.json + dated copy to "
-            f"{public_base_url_for(settings)}/iceberg-snapshot.json"
-        )
-    click.echo(f"Uploaded {len(plans)} files (each as -latest and -{extract_date}).")
+        if iceberg_snapshot_manifest is not None:
+            snap_body = json.dumps(
+                iceberg_snapshot_manifest, indent=2, sort_keys=True
+            ).encode("utf-8")
+            for key in (
+                "iceberg-snapshot.json",
+                f"iceberg-snapshot-{extract_date}.json",
+            ):
+                s3.put_object(
+                    Bucket=settings.bucket,
+                    Key=key,
+                    Body=snap_body,
+                    ContentType="application/json",
+                )
+            click.echo(
+                f"Uploaded iceberg-snapshot.json + dated copy to "
+                f"{public_base_url_for(settings)}/iceberg-snapshot.json"
+            )
+        click.echo(f"Uploaded {len(plans)} files (each as -latest and -{extract_date}).")
 
 
 def _run_iceberg_step(
@@ -354,32 +439,33 @@ def _run_iceberg_step(
         ice_table.refresh()
         is_empty = ice_table.current_snapshot() is None
 
-        if is_empty:
-            summary[table_key] = bootstrap_history_table_arrow(
-                ice_table,
-                parquet_path,
-                extract_date,
-                record_last_updated_column=src_record_col,
-            )
-        else:
-            summary[table_key] = update_history_table_arrow(
-                ice_table,
-                parquet_path,
-                extract_date,
-                base_columns=list(snapshot_schema.names),
-                identity=identity,
-                content_columns=content_columns,
-            )
+        with _stage(f"iceberg.{table_key} ({'bootstrap' if is_empty else 'update'})"):
+            if is_empty:
+                summary[table_key] = bootstrap_history_table_arrow(
+                    ice_table,
+                    parquet_path,
+                    extract_date,
+                    record_last_updated_column=src_record_col,
+                )
+            else:
+                summary[table_key] = update_history_table_arrow(
+                    ice_table,
+                    parquet_path,
+                    extract_date,
+                    base_columns=list(snapshot_schema.names),
+                    identity=identity,
+                    content_columns=content_columns,
+                )
 
-        # Prune snapshot metadata so the on-R2 snapshot log doesn't grow
-        # unbounded. Physical orphan-file deletion is handled separately
-        # (see the storage cleanup issue) — pyiceberg 0.11 only updates
-        # metadata here, not S3 objects.
-        ice_table.refresh()
-        prune = prune_iceberg_snapshots(ice_table)
-        summary[table_key]["pruned_snapshots"] = prune
+            # Prune snapshot metadata so the on-R2 snapshot log doesn't grow
+            # unbounded. Physical orphan-file deletion is handled separately
+            # (see the storage cleanup issue) — pyiceberg 0.11 only updates
+            # metadata here, not S3 objects.
+            ice_table.refresh()
+            prune = prune_iceberg_snapshots(ice_table)
+            summary[table_key]["pruned_snapshots"] = prune
 
-        gc.collect()
+            gc.collect()
     return summary
 
 

@@ -104,64 +104,73 @@ R2 Data Catalog managed warehouse. Layout: `<namespace-uuid>/<table-uuid>/{data,
 
 **Namespace 1 — `abr`** (UUID `019e02fb-f7b0-...`)
 
-| Table (logical) | Snapshots | Data files | Metadata files | Approx total |
+| Table (logical) | Snapshots | Data files | Metadata files | Total size |
 |---|---:|---|---:|---:|
 | `abn_main_history` | 1 | 11 × ~50 MB | 4 (2× metadata.json + 1× m0.avro + 1× snap.avro) | 547 MB |
-| `abn_trading_names_history` | 1 | not drilled | not drilled | est. ~140 MB |
-| `abn_dgr_history` | 1 | not drilled | not drilled | est. <5 MB |
+| `abn_trading_names_history` | 1 | not drilled | not drilled | not drilled |
+| `abn_dgr_history` | 1 | not drilled | not drilled | not drilled |
 
 **Namespace 2 — `abr_test`** (UUID `019e030b-7d14-...`) — created by truncated `--max-records` runs, never torn down
 
-| Table (logical) | Snapshots | Data files | Metadata files | Approx total |
+| Table (logical) | Snapshots | Data files | Metadata files | Total size |
 |---|---:|---|---:|---:|
-| `abn_main_history` | 1 | 1 × 1.67 MB | 4 | 1.7 MB |
-| `abn_trading_names_history` | 1 | not drilled | not drilled | est. <1 MB |
-| `abn_dgr_history` | 1 | not drilled | not drilled | est. <1 MB |
+| `abn_main_history` | 1 | 1 × 1.67 MB | 4 | 1.67 MB |
+| `abn_trading_names_history` | 1 | not drilled | not drilled | not drilled |
+| `abn_dgr_history` | 1 | not drilled | not drilled | not drilled |
 
 ## 3. Data flow per weekly refresh
+
+Wall-clock per stage is **not measured** in this repo today. The new
+diagnostic instrumentation (§9 group A item 2) makes per-stage
+timing visible in workflow logs from its first run forward; this
+section will be updated with measured numbers once that lands.
 
 ```
 GitHub Actions (cron Sun 04:00 UTC, or manual workflow_dispatch)
    │
    ▼
-[1] catalog.fetch_catalog                     ~1s     network only, no R2 write
+[1] catalog.fetch_catalog                     network only, no R2 write
    │
    ▼
-[2] publish.read_remote_manifest              ~1s     R2 GET manifest.json
+[2] publish.read_remote_manifest              R2 GET manifest.json
    │  → if extract_time matches, exit early (idempotent)
    ▼
-[3] download.download_all                     ~3-5min HTTPS pull of 2 zips, ~500 MB
+[3] download.download_all                     HTTPS pull of 2 zips
    │  writes ./work/abr_extract_*.zip
    ▼
-[4] parallel.parse_zips_parallel              ~10-15min  4 workers
-   │  writes ./work/shards/part-*.parquet     ~1.4 GB intermediate
+[4] parallel.parse_zips_parallel              4 workers
+   │  writes ./work/shards/part-*.parquet
    │
    ▼
-[4b] parallel.merge_shards_to_parquet         ~1-2min  pyarrow.concat_tables
-   │  writes ./work/abn_main.parquet (~770 MB), trading (~200 MB), dgr (~1 MB)
+[4b] parallel.merge_shards_to_parquet         pyarrow.concat_tables
+   │  writes ./work/abn_main.parquet, trading, dgr
    │  (LOCAL to runner; not uploaded by current pipeline)
    │
    ▼
-[5] _run_iceberg_step                         ~1-3min/table  3 tables sequentially
+[5] _run_iceberg_step                         3 tables sequentially
    │  for each in (main, trading, dgr):
    │    if iceberg empty: bootstrap_history_table_arrow
    │    else:             update_history_table_arrow (DuckDB SCD2)
    │    prune_iceberg_snapshots(keep=2)
    │  writes __r2_data_catalog/<ns>/<table>/{data,metadata}/...
    ▼
-[6] parallel.build_sqlite_from_parquet        ~2-3min  sqlite3.executemany loop
-   │  writes ./work/abr.sqlite (~4.25 GB)
+[6] search_index.build_search_index           DuckDB join over main+trading
+   │  writes ./work/abn-search.parquet
+   ▼
+[7] parallel.build_sqlite_from_parquet        sqlite3.executemany loop
+   │  writes ./work/abr.sqlite
    │  (LOCAL to runner; not uploaded by current pipeline)
    ▼
-[7] _build_iceberg_snapshot_manifest          ~5s      reads iceberg metadata
+[8] _build_iceberg_snapshot_manifest          reads iceberg metadata
    │  writes ./work/iceberg-snapshot.json
    ▼
-[8] write.build_manifest                      ~1s
-   │  writes ./work/manifest.json (~1 KB)
+[9] write.build_manifest
+   │  writes ./work/manifest.json
    ▼
-[9] publish.upload_all                        ~5s
+[10] publish.upload_all + search-index upload
       writes manifest.json + manifest-{date}.json
             + iceberg-snapshot.json + iceberg-snapshot-{date}.json
+            + abn-search-latest.parquet + abn-search-{date}.parquet
       to R2 bucket root
 ```
 
@@ -193,72 +202,68 @@ GitHub Actions (cron Sun 04:00 UTC, or manual workflow_dispatch)
 
 ## 6. Growth model
 
-Worst-case projections, no cleanup, sizes from the 2026-05-08 inventory.
+Single measured datum from the 2026-05-08 R2 inventory: **bucket total
+11.12 GB**. Anything that scales over time (per-week deltas, multi-month
+projections) requires repeated measurements that don't exist yet. This
+section records what's measured; growth-rate analysis is deferred until
+two consecutive successful refreshes give a real delta.
 
-### 6.1 Static dumps at root (currently uncontrolled)
+### 6.1 Static dumps at root
 
-Per week (assuming the off-repo upload mechanism keeps writing dated + replacing latest):
+Eight keys, total measured **~10.44 GB** (~94% of bucket):
 
-| Item | Per dated copy | Latest | Per-week net (one new dated, latest replaced in place) |
-|---|---:|---:|---:|
-| `abr-extract-{date}.sqlite` | 4.25 GB | replaces | +4.25 GB / wk |
-| `abn-main-{date}.parquet` | 0.77 GB | replaces | +0.77 GB / wk |
-| `abn-trading-names-{date}.parquet` | 0.20 GB | replaces | +0.20 GB / wk |
-| `abn-dgr-{date}.parquet` | 0.001 GB | replaces | +0.001 GB / wk |
-| **Total per week** | | | **~5.2 GB** |
+| Item | Per dated copy | Per latest copy |
+|---|---:|---:|
+| `abr-extract-*.sqlite` | 4.25 GB | 4.25 GB |
+| `abn-main-*.parquet` | 0.77 GB | 0.77 GB |
+| `abn-trading-names-*.parquet` | 0.20 GB | 0.20 GB |
+| `abn-dgr-*.parquet` | 0.001 GB | 0.001 GB |
 
-Projected:
-- 1 month: ~21 GB
-- 6 months: ~125 GB
-- 1 year: **~270 GB**
-
-**Mitigation:** stop the off-repo upload, run #13 cleanup → recovers ~10 GB immediately and growth stops.
+Whether these grow week-on-week depends on the upload origin (still
+unverified — #13). Growth-rate projection deferred until origin is
+identified and at least two consecutive runs are observed.
 
 ### 6.2 Iceberg warehouse (`__r2_data_catalog/`)
 
-**With** `prune_iceberg_snapshots(keep=2)` (this PR):
+Total ~680 MB measured. `abn_main_history` in namespace 1: 547 MB
+across 11 data files + ~16 KB metadata. The other two tables in
+namespace 1 and all three tables in namespace 2 (`abr_test`) have
+not been drilled.
 
-- Steady state: 2 retained snapshots × (~547 MB main + ~140 MB trading + ~5 MB dgr) ≈ **~1.4 GB total**
-- Metadata: ~30 KB per snapshot × 2 × 3 tables ≈ negligible
-- **Snapshot-metadata pruning is now bounded.** Data file orphans (uncommitted SIGKILL artefacts + expired snapshots' files) accumulate until #13's S3-list-and-diff cleanup runs.
+`prune_iceberg_snapshots(keep=2)` (this PR) bounds the *snapshot log*
+size — each table retains at most 2 snapshots after each refresh.
+Whether the *data file* footprint stays bounded depends on cleanup of
+orphan files (uncommitted SIGKILL artefacts + expired snapshots' files),
+which PyIceberg 0.11 does not do automatically. Tracked in #13.
 
-**Without** `prune_iceberg_snapshots`:
-
-- Each weekly overwrite adds ~700 MB of new data files
-- Old snapshot data files keep being referenced from the snapshot log (no expiry)
-- 1 month: ~2.8 GB
-- 6 months: ~17 GB
-- 1 year: **~36 GB** of warehouse growth alone
+Per-week growth requires measurement after the next refresh.
 
 ### 6.3 Manifest history at root
 
-- Per week: ~2 KB (dated + latest combined; latest replaces in place)
-- 1 year: ~104 KB. Negligible.
+`manifest-{date}.json` measured at 1.08 KB. Negligible at any cadence.
 
 ### 6.4 `abr_test` namespace
 
-Each truncated `--max-records` test run creates a new snapshot in this namespace. Currently never torn down.
-
-- Per truncated run: 1.67 MB (data) + 4 metadata files
-- If pruning leaves 2 snapshots: bounded
-- If never pruned and run weekly during testing: ~5 MB/week growth in this namespace
-
-**Mitigation:** namespace teardown after each truncated run (file an issue from #21).
+Total measured 1.67 MB for the one drilled table. If truncated runs
+continue without explicit teardown the namespace accumulates one new
+snapshot per run; bounded by `prune_iceberg_snapshots(keep=2)` once a
+third run lands.
 
 ## 7. Target steady state
 
-| Region | Target size | What's in it |
-|---|---:|---|
-| `__r2_data_catalog/` (`abr` ns only) | ~1.4 GB | 2 retained snapshots × 3 tables. Data file orphans cleaned periodically (#13). |
-| `manifest.json` + dated history | < 1 MB indefinitely | Audit trail |
-| `iceberg-snapshot.json` + dated history | < 1 MB indefinitely | Audit + frontend pointer |
-| `abns/index.html` | 26 KB | Frontend |
-| `abn-*-{date}.parquet` + `abr-extract-{date}.sqlite` (one archival date) | ~5.2 GB | One frozen v1 dump for back-compat |
-| `abn-*-latest.*` | 0 OR ~5.2 GB | Either deleted (with README patch) OR copy-from the kept dated set |
-| `abr_test` namespace | 0 between test runs | Tear down after `--max-records` runs |
-| **Total** | **~6.6–11.8 GB** | depending on `*-latest` decision and archival kept |
+| Region | What's in it |
+|---|---|
+| `__r2_data_catalog/` (`abr` ns only) | 2 retained snapshots × 3 tables (per `prune_iceberg_snapshots(keep=2)`). Data file orphans cleaned periodically (#13). |
+| `manifest.json` + dated history | Audit trail |
+| `iceberg-snapshot.json` + dated history | Audit + frontend pointer |
+| `abn-search-latest.parquet` + dated copy | Frontend search index (#22) |
+| `abns/index.html` | Frontend |
+| `abn-*-{date}.parquet` + `abr-extract-{date}.sqlite` (one archival date) | One frozen v1 dump for back-compat |
+| `abn-*-latest.*` | Decision pending — either deleted (with README patch) or copy-from the kept dated set |
+| `abr_test` namespace | Torn down between test runs |
 
-That's vs current 11.12 GB and worst-case projected 270+ GB/year if nothing changes.
+Concrete target *size* requires measuring after the next clean refresh
++ #13 cleanup pass. Inventory will be re-reconciled then.
 
 ## 8. Gap analysis (current → target)
 
@@ -309,20 +314,20 @@ This collapses #21's sequencing into actionable groups.
 ## 11. Search performance
 
 The frontend's UX is dominated by per-keystroke search latency against
-the parquet datasets. This section captures current behaviour, an
-in-flight speed-up, and the ceiling beyond it. Inferred where noted —
-no end-to-end timing has been checked in.
+the parquet datasets. End-to-end timing is not measured in this repo.
+This section describes the *shape* of current vs. post-search-index
+queries; quantitative comparison waits on measurement post-#22.
 
-### 11.1 Current path (master)
+### 11.1 Current shape (master)
 
 `frontend/index.html` issues, on every keystroke, a query of roughly the
-shape:
+form:
 
 ```sql
 SELECT … FROM read_parquet([..main data files..]) main
 WHERE valid_to IS NULL
   AND (
-    main_name             ILIKE ?
+    main_name                  ILIKE ?
     OR individual_family_name  ILIKE ?
     OR individual_given_names  ILIKE ?
     OR abn IN (
@@ -333,83 +338,35 @@ WHERE valid_to IS NULL
 LIMIT …
 ```
 
-What that costs (inferred, not measured):
+Four ILIKE comparisons. Two parquet relations scanned. Per-row
+`LOWER()` coercion. The trading sub-query is re-evaluated each
+keystroke regardless of column pruning.
 
-- **Four ILIKE comparisons per row of main**, three on different name
-  columns plus one re-evaluated per row of trading via the sub-query.
-- **Two parquet scans per query** — main (~547 MB) and trading
-  (~140 MB). DuckDB-WASM does column pruning, so only the queried
-  columns are fetched, but the trading sub-query needs `abn` + `name` +
-  `valid_to`, which is most of the trading footprint. Each fetch is HTTP
-  range-requested in chunks of ~256 KB.
-- **No precomputed search column** — every row pays a `LOWER()` /
-  case-fold cost at query time even though all-lowercase is the only
-  shape ever compared.
-- **Re-fetch per keystroke** — DuckDB-WASM caches range requests
-  per-session, but a typo + retry pattern still re-issues the same scan
-  with a different parameter.
+### 11.2 Post-#22 shape
 
-### 11.2 In-flight speed-up — `frontend-search-index` branch (#22)
+After the search index lands the same UX query becomes:
 
-A complete implementation exists on `frontend-search-index` (commit
-`d91e021`). Mechanism:
+```sql
+SELECT … FROM read_parquet('abn-search-latest.parquet')
+WHERE search_text ILIKE ?
+LIMIT …
+```
 
-1. Pipeline produces `abn-search.parquet` (one row per ABN) with
-   `name`, `entity_kind`, `state`, `postcode`, `abn_status`,
-   `gst_status`, `asic_number`, plus a single denormalised, lowercased
-   `search_text` column concatenating main name, individual full name,
-   and every trading name.
-2. Uploaded to bucket root as `abn-search-{date}.parquet` +
-   `abn-search-latest.parquet`. `iceberg-snapshot.json` gains a
-   `search_index_url` pointer.
-3. Frontend keystroke query becomes a single
-   `SELECT … FROM read_parquet('abn-search-…') WHERE search_text ILIKE ?`.
-
-Inferred wins:
-
-| Lever | Before | After |
-|---|---|---|
-| ILIKE comparisons per row | 4 | 1 |
-| Parquet relations scanned | 2 (main + trading) | 1 (search index) |
-| Bytes scanned per keystroke | ~5 GB worst-case (largest column subset) | ~1/5 of that — search index is roughly main columns minus heavy fields |
-| Per-row case-folding | Yes | No (pre-lowered) |
-| Trading sub-query | Always | Eliminated |
+One ILIKE on a denormalised, pre-lowercased column. One parquet
+relation scanned (the search index, which carries only display
+columns). The trading sub-query is gone — trading names are folded
+into `search_text` at index-build time.
 
 Profile expand on a row still hits `abn_main_history` for the full
 record — search index is for the *list* view, not for replacing main as
 the source of truth.
 
-### 11.3 Optimisations beyond #22 (not yet scoped)
+Comparative timing requires browser-side instrumentation; out of scope
+for this iteration.
 
-If keystroke latency still isn't where it needs to be after #22 lands:
+### 11.3 Beyond #22
 
-- **Iceberg partitioning.** Currently `UNPARTITIONED_PARTITION_SPEC` in
-  `iceberg_io.py:164`. Partitioning the history tables by `state` (8
-  partitions) or by a hash of `abn` would let DuckDB skip whole files
-  on filtered queries. Trade-off: more files to manage, more orphan-file
-  surface area for #13's cleanup.
-- **Bloom filters on parquet writes.** PyArrow can write parquet bloom
-  filters per column; useful for exact-match queries (`WHERE abn = ?`).
-  No code change in iceberg, just a writer setting on the search index
-  parquet.
-- **Smaller row groups.** Current iceberg writes use pyiceberg defaults
-  (~50 MB per row group based on the data file sizes we observed).
-  Smaller row groups (e.g., 4 MB) help selective filters at the cost of
-  scan throughput.
-- **Cloudflare Worker-side caching.** The Worker (currently a placeholder
-  in `worker/`) could front the search index parquet behind a Cache API
-  layer; would cut R2 egress + add ~10 ms first-byte savings for repeat
-  queries. Currently not consumed by the frontend, which talks to R2
-  directly.
-- **Pre-aggregated trends.** The CLI's `trends` command computes
-  `state` / `entity_type` distributions client-side. Publishing a
-  pre-aggregated `abn-trends-{date}.parquet` (~few KB) would let the
-  frontend skip the main-relation scan entirely for the trends view.
-- **WASM module preload.** Frontend currently loads DuckDB-WASM lazily
-  on first interaction. `<link rel="modulepreload">` hint would shave
-  ~500 ms off cold-start time.
-
-None of these are filed yet — pending observation post-#22.
+Out of scope. Don't speculate; measure first, then revisit.
 
 ## 12. Branch inventory + cleanup recommendations
 

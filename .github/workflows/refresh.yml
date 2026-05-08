@@ -38,7 +38,15 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
+      - name: Baseline runner state
+        run: |
+          set -x
+          free -h
+          df -h /
+          ulimit -a
+
       - name: Run pipeline
+        id: pipeline
         env:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -48,6 +56,42 @@ jobs:
           R2_CATALOG_TOKEN: ${{ secrets.R2_CATALOG_TOKEN }}
           R2_BUCKET: weekly-abr-dataset
         run: |
+          set -x
           uv run abr-extract run --output-dir ./work \
             ${{ inputs.force && '--force' || '' }} \
             ${{ inputs.max_records != '' && format('--max-records {0}', inputs.max_records) || '' }}
+
+      - name: Capture failure diagnostics
+        if: failure()
+        run: |
+          set +e
+          echo "::group::dmesg tail"
+          dmesg | tail -100 || sudo dmesg | tail -100 || echo "dmesg unavailable"
+          echo "::endgroup::"
+          echo "::group::free -h"
+          free -h
+          echo "::endgroup::"
+          echo "::group::df -h"
+          df -h
+          echo "::endgroup::"
+          echo "::group::work/ tree"
+          ls -lhR work/ 2>/dev/null || echo "no work/ directory"
+          echo "::endgroup::"
+          echo "::group::work/manifest.json"
+          cat work/manifest.json 2>/dev/null || echo "no manifest.json — pipeline did not reach step 9"
+          echo "::endgroup::"
+          echo "::group::work/iceberg-snapshot.json"
+          cat work/iceberg-snapshot.json 2>/dev/null || echo "no iceberg-snapshot.json — pipeline did not reach step 8"
+          echo "::endgroup::"
+
+      - name: Upload work/ artefacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: refresh-debug-${{ github.run_id }}
+          path: |
+            work/manifest.json
+            work/iceberg-snapshot.json
+            work/abn-search.parquet
+          if-no-files-found: ignore
+          retention-days: 14
