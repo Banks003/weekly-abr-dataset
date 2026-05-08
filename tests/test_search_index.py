@@ -97,3 +97,42 @@ def test_search_index_handles_abn_with_no_trading_names(tmp_path: Path):
     qbe = df.filter(pl.col("abn") == "11000000948").to_dicts()[0]
     assert qbe["search_text"] is not None
     assert qbe["search_text"].strip() != ""
+
+
+def test_search_index_is_sorted_by_search_text(tmp_path: Path):
+    """Rows must be physically sorted by search_text so DuckDB can use the
+    parquet column statistics to prune row groups for prefix predicates."""
+    paths = _build_canonical(tmp_path)
+    dest = tmp_path / "abn-search.parquet"
+    build_search_index(paths.main_parquet, paths.trading_parquet, dest)
+    search_texts = pl.read_parquet(dest).get_column("search_text").to_list()
+    assert search_texts == sorted(search_texts)
+
+
+def test_search_index_declares_sort_and_bloom_metadata(tmp_path: Path):
+    """The writer should emit Parquet-level hints — sorting_columns metadata
+    on each row group, and a Bloom filter on ``abn`` — so readers know the
+    file is sorted and can use the bloom for the exact-ABN lookup path."""
+    import duckdb
+    import pyarrow.parquet as pq
+
+    paths = _build_canonical(tmp_path)
+    dest = tmp_path / "abn-search.parquet"
+    build_search_index(paths.main_parquet, paths.trading_parquet, dest)
+
+    pf = pq.ParquetFile(dest)
+    search_text_idx = pf.schema_arrow.get_field_index("search_text")
+    sorting = pf.metadata.row_group(0).sorting_columns
+    assert sorting and sorting[0].column_index == search_text_idx
+
+    # PyArrow doesn't expose bloom filter metadata; DuckDB does.
+    with duckdb.connect() as duck:
+        rows = duck.execute(
+            "SELECT path_in_schema, bloom_filter_offset "
+            "FROM parquet_metadata(?)",
+            [str(dest)],
+        ).fetchall()
+    abn_offsets = {offset for path, offset in rows if path == "abn"}
+    assert all(o is not None for o in abn_offsets), (
+        "abn column chunks should each carry a bloom filter offset"
+    )

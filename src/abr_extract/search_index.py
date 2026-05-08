@@ -14,12 +14,17 @@ containing only the fields the search UI actually needs, plus a single
 pre-lowercased ``search_text`` column that concatenates every name a
 user might type — main name, individual full name, and all trading
 names — into one string. The frontend reads this index for the filter
-(``WHERE search_text ILIKE ?``) and joins back to ``abn_main_history``
-only for the visible page if it needs columns the index doesn't carry.
+and joins back to ``abn_main_history`` only for the visible page if it
+needs columns the index doesn't carry.
 
-The result is one ILIKE on a much smaller, denormalised relation in
-place of four ORs across two relations — typically a ~5-10x latency
-drop on partial-name searches.
+Two extra build-time tweaks let DuckDB-WASM prune most of the index on
+common queries:
+
+* Rows are sorted by ``search_text`` and written in ~50k-row groups, so
+  Parquet column statistics let DuckDB skip whole row groups for prefix
+  predicates (``search_text LIKE 'qan%'`` is the frontend's default).
+* A Bloom filter is written on ``abn``, so the exact-ABN lookup
+  (``WHERE abn = ?``) typically reads one row group.
 """
 
 from __future__ import annotations
@@ -85,6 +90,7 @@ SELECT
     ) AS search_text
 FROM read_parquet(?) m
 LEFT JOIN trading_concat t ON t.abn = m.abn
+ORDER BY search_text, m.abn
 """
 
 
@@ -118,8 +124,21 @@ def build_search_index(
         # DuckDB's strict types occasionally trip up the cast.
         # PyArrow Table.cast(target_schema) coerces type-compatible columns.
         casted = table.cast(ABN_SEARCH_SCHEMA)
-        with pq.ParquetWriter(dest, ABN_SEARCH_SCHEMA, compression="snappy") as w:
-            w.write_table(casted)
+        search_text_idx = ABN_SEARCH_SCHEMA.get_field_index("search_text")
+        pq.write_table(
+            casted,
+            dest,
+            compression="snappy",
+            # Small row groups + per-page stats let DuckDB-WASM prune by
+            # ``search_text`` zone maps for prefix queries.
+            row_group_size=50_000,
+            write_page_index=True,
+            sorting_columns=[pq.SortingColumn(column_index=search_text_idx)],
+            # Bloom filter on the high-cardinality ``abn`` column so the
+            # 11-digit exact-lookup path can skip every row group except
+            # the one containing the match.
+            bloom_filter_options={"abn": True},
+        )
     finally:
         duck.close()
 
