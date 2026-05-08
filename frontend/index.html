@@ -383,7 +383,7 @@
 <section class="find-section">
   <div class="section-label">Find an Entry</div>
   <div class="controls">
-    <input type="text" id="q" placeholder='by name, ABN, or trading name — try "qantas"'>
+    <input type="text" id="q" placeholder='by name, ABN, or trading name — try "qantas" (prefix; *foo for substring)'>
     <select id="state-filter">
       <option value="">Any state</option>
       <option>NSW</option><option>VIC</option><option>QLD</option>
@@ -578,15 +578,22 @@
     const params = [];
 
     // All filtering — text and structured — happens against the slim
-    // search index. ABN lookup uses an exact match; substring search hits
-    // a single ILIKE on the pre-lowercased search_text column.
+    // search index. ABN lookup uses an exact match (Bloom-filtered on
+    // the writer side). Name search defaults to a prefix LIKE so DuckDB
+    // can prune row groups via the parquet stats on the search_text
+    // column; a leading "*" opts into substring ILIKE for matching
+    // mid-string (e.g. trading names buried after the main name).
     if (q) {
-      if (/^\d{11}$/.test(q.replace(/\s/g, ''))) {
+      const digits = q.replace(/\s/g, '');
+      if (/^\d{11}$/.test(digits)) {
         filters.push('abn = ?');
-        params.push(q.replace(/\s/g, ''));
-      } else {
+        params.push(digits);
+      } else if (q.startsWith('*')) {
         filters.push('search_text ILIKE ?');
-        params.push(`%${q.toLowerCase()}%`);
+        params.push(`%${q.slice(1).toLowerCase()}%`);
+      } else {
+        filters.push('search_text LIKE ?');
+        params.push(`${q.toLowerCase()}%`);
       }
     }
     if (state) { filters.push('state = ?'); params.push(state); }
