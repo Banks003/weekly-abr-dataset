@@ -4,33 +4,21 @@ from datetime import date
 from pathlib import Path
 
 import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
-from abr_extract.history import (
-    MAIN_CONTENT_COLUMNS,
-    MAIN_IDENTITY,
-    TRADING_CONTENT_COLUMNS,
-    TRADING_IDENTITY,
-    apply_update_main,
-    apply_update_trading,
-    bootstrap_main,
-    bootstrap_trading,
-)
 from abr_extract.iceberg_io import (
     ABN_MAIN_HISTORY_SCHEMA,
-    ABN_TRADING_HISTORY_SCHEMA,
     TABLE_SCHEMAS,
-    bootstrap_history_table_arrow,
+    _s3_to_public_url,
+    build_snapshot_manifest,
     connect_local_catalog,
     ensure_history_tables,
+    overwrite_table_from_parquet,
     prune_iceberg_snapshots,
-    update_history_table_arrow,
-    write_history,
 )
-from abr_extract.schema import (
-    ABN_MAIN_SCHEMA,
-    ABN_TRADING_NAMES_SCHEMA,
-)
+from abr_extract.schema import ABN_MAIN_SCHEMA
 
 
 @pytest.fixture
@@ -70,6 +58,11 @@ def _main_row(**overrides) -> dict:
     return base
 
 
+def _write_main_parquet(rows: list[dict], path: Path) -> Path:
+    pq.write_table(pa.Table.from_pylist(rows, schema=ABN_MAIN_SCHEMA), path)
+    return path
+
+
 # --- catalog & table lifecycle ------------------------------------------
 
 
@@ -89,28 +82,63 @@ def test_ensure_history_tables_is_idempotent(catalog):
         assert first[name].name() == second[name].name()
 
 
-# --- write + read round-trip --------------------------------------------
+def test_ensure_history_tables_drops_and_recreates_on_schema_mismatch(catalog):
+    """An old SCD2-shaped table should be dropped + recreated with the new schema.
+
+    Simulates the migration: a table exists with extra ``valid_from`` /
+    ``valid_to`` / ``snapshot_observed_date`` columns. ``ensure_table``
+    should detect the mismatch via ``_schemas_match`` and drop+recreate.
+    """
+    from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC
+    from pyiceberg.schema import Schema
+    from pyiceberg.types import DateType, NestedField, StringType
+
+    old_schema = Schema(
+        NestedField(1, "abn", StringType(), required=True),
+        NestedField(2, "abn_status", StringType()),
+        NestedField(3, "valid_from", DateType(), required=True),
+        NestedField(4, "valid_to", DateType()),
+    )
+    catalog.create_namespace_if_not_exists("abr_test")
+    catalog.create_table(
+        "abr_test.abn_main_history",
+        schema=old_schema,
+        partition_spec=UNPARTITIONED_PARTITION_SPEC,
+    )
+
+    # ensure_history_tables should detect the mismatch and recreate
+    tables = ensure_history_tables(catalog, namespace="abr_test")
+    new_fields = {f.name for f in tables["abn_main_history"].schema().fields}
+    # SCD2 columns gone, full main schema present
+    assert "valid_from" not in new_fields
+    assert "valid_to" not in new_fields
+    assert "snapshot_observed_date" not in new_fields
+    assert "main_name" in new_fields
+    assert "abn_status_from_date" in new_fields
 
 
-def test_write_and_read_main_history_roundtrip(tables):
-    snapshot = pl.DataFrame([_main_row()])
-    history = bootstrap_main(snapshot, date(2026, 5, 6))
-    write_history(tables["abn_main_history"], history, schema=ABN_MAIN_HISTORY_SCHEMA)
+# --- overwrite + read round-trip ----------------------------------------
+
+
+def test_overwrite_table_from_parquet_writes_rows(tables, tmp_path):
+    parquet_path = _write_main_parquet([_main_row()], tmp_path / "w1.parquet")
+    summary = overwrite_table_from_parquet(tables["abn_main_history"], parquet_path)
+    assert summary["rows_written"] == 1
 
     table = tables["abn_main_history"]
     table.refresh()
     df = pl.from_arrow(table.scan().to_arrow())
     assert df.height == 1
     assert df["abn"].to_list() == ["11111111111"]
-    assert df["valid_to"].to_list() == [None]
+    assert df["main_name"].to_list() == ["ACME PTY LTD"]
 
 
-def test_overwrite_replaces_all_rows(tables):
-    history_a = bootstrap_main(pl.DataFrame([_main_row(abn="11111111111")]), date(2026, 5, 6))
-    history_b = bootstrap_main(pl.DataFrame([_main_row(abn="22222222222")]), date(2026, 5, 13))
+def test_overwrite_replaces_all_rows(tables, tmp_path):
+    p1 = _write_main_parquet([_main_row(abn="11111111111")], tmp_path / "w1.parquet")
+    p2 = _write_main_parquet([_main_row(abn="22222222222")], tmp_path / "w2.parquet")
 
-    write_history(tables["abn_main_history"], history_a, schema=ABN_MAIN_HISTORY_SCHEMA)
-    write_history(tables["abn_main_history"], history_b, schema=ABN_MAIN_HISTORY_SCHEMA)
+    overwrite_table_from_parquet(tables["abn_main_history"], p1)
+    overwrite_table_from_parquet(tables["abn_main_history"], p2)
 
     table = tables["abn_main_history"]
     table.refresh()
@@ -118,79 +146,40 @@ def test_overwrite_replaces_all_rows(tables):
     assert df["abn"].to_list() == ["22222222222"]
 
 
-# --- multi-week update through Iceberg ----------------------------------
+def test_overwrite_creates_snapshots(tables, tmp_path):
+    """Each weekly overwrite contributes to Iceberg's snapshot history.
 
-
-def test_two_week_update_through_iceberg_yields_closed_and_open_rows(tables):
-    week1 = pl.DataFrame([_main_row(state="NSW")])
-    history = bootstrap_main(week1, date(2026, 5, 6))
-    write_history(tables["abn_main_history"], history, schema=ABN_MAIN_HISTORY_SCHEMA)
-
+    PyIceberg's ``table.overwrite`` is implemented as DELETE + APPEND
+    in two snapshots per call (except the first, where DELETE is a
+    no-op skipped because there's nothing to remove). The exact ratio
+    is an implementation detail of pyiceberg; what matters for our
+    time-travel use is that the snapshot count climbs monotonically
+    so consumers can read older states.
+    """
     table = tables["abn_main_history"]
-    table.refresh()
-    persisted = pl.from_arrow(table.scan().to_arrow())
-
-    week2 = pl.DataFrame([_main_row(state="VIC")])
-    history2 = apply_update_main(persisted, week2, date(2026, 5, 13))
-    write_history(tables["abn_main_history"], history2, schema=ABN_MAIN_HISTORY_SCHEMA)
-
-    table.refresh()
-    df = pl.from_arrow(table.scan().to_arrow())
-    assert df.height == 2
-    closed = df.filter(pl.col("valid_to").is_not_null()).to_dicts()
-    open_rows = df.filter(pl.col("valid_to").is_null()).to_dicts()
-    assert len(closed) == 1
-    assert closed[0]["state"] == "NSW"
-    assert closed[0]["valid_to"] == date(2026, 5, 13)
-    assert len(open_rows) == 1
-    assert open_rows[0]["state"] == "VIC"
-
-
-def test_trading_names_history_set_membership_through_iceberg(tables):
-    week1 = pl.DataFrame(
-        [
-            {"abn": "11111111111", "name": "ACME", "name_type": "BN"},
-            {"abn": "11111111111", "name": "ACME PRODUCTS", "name_type": "BN"},
-        ]
-    )
-    history = bootstrap_trading(week1, date(2026, 5, 6))
-    write_history(
-        tables["abn_trading_names_history"], history, schema=ABN_TRADING_HISTORY_SCHEMA
-    )
-
-    table = tables["abn_trading_names_history"]
-    table.refresh()
-    persisted = pl.from_arrow(table.scan().to_arrow())
-
-    week2 = pl.DataFrame(
-        [
-            {"abn": "11111111111", "name": "ACME", "name_type": "BN"},
-            {"abn": "11111111111", "name": "ACME GLOBAL", "name_type": "BN"},
-        ]
-    )
-    history2 = apply_update_trading(persisted, week2, date(2026, 5, 13))
-    write_history(
-        tables["abn_trading_names_history"], history2, schema=ABN_TRADING_HISTORY_SCHEMA
-    )
-
-    table.refresh()
-    df = pl.from_arrow(table.scan().to_arrow()).sort(["name", "valid_from"])
-    rows = df.to_dicts()
-    names_seen = {r["name"] for r in rows}
-    assert names_seen == {"ACME", "ACME PRODUCTS", "ACME GLOBAL"}
-    closed = [r for r in rows if r["valid_to"] is not None]
-    assert len(closed) == 1
-    assert closed[0]["name"] == "ACME PRODUCTS"
+    counts = []
+    for i in range(3):
+        overwrite_table_from_parquet(
+            table,
+            _write_main_parquet([_main_row(state=f"S{i}")], tmp_path / f"w{i}.parquet"),
+        )
+        table.refresh()
+        counts.append(len(list(table.metadata.snapshots)))
+    # Strictly increasing.
+    assert counts == sorted(set(counts)) and len(counts) == len(set(counts))
+    # At least one snapshot per overwrite, possibly more (DELETE+APPEND pair).
+    assert counts[-1] >= 3
 
 
 # --- schema invariants --------------------------------------------------
 
 
-def test_main_history_schema_includes_scd2_columns():
+def test_main_history_schema_excludes_scd2_columns():
+    """SCD2 columns must NOT be in the post-migration schema."""
     fields = {f.name for f in ABN_MAIN_HISTORY_SCHEMA.fields}
-    assert "valid_from" in fields
-    assert "valid_to" in fields
-    assert "snapshot_observed_date" in fields
+    assert "valid_from" not in fields
+    assert "valid_to" not in fields
+    assert "snapshot_observed_date" not in fields
 
 
 def test_table_schemas_dict_is_exhaustive():
@@ -201,12 +190,7 @@ def test_table_schemas_dict_is_exhaustive():
     }
 
 
-# Snapshot manifest (M10) ---------------------------------------------------
-
-from abr_extract.iceberg_io import (  # noqa: E402
-    _s3_to_public_url,
-    build_snapshot_manifest,
-)
+# --- snapshot manifest ---------------------------------------------------
 
 
 def test_s3_to_public_url_translates_warehouse_paths():
@@ -229,22 +213,11 @@ def test_s3_to_public_url_passes_through_unrelated_paths():
     assert out == "https://example.com/some.parquet"
 
 
-def test_build_snapshot_manifest_lists_tables_with_data_files(tables):
-    """After bootstrapping a history table, the manifest should list its
-    data file URLs, snapshot id, and a non-zero row count."""
-    main = pl.DataFrame([_main_row()], schema={
-        "abn": pl.Utf8, "abn_status": pl.Utf8, "abn_status_from_date": pl.Date,
-        "record_last_updated": pl.Date, "replaced": pl.Utf8,
-        "entity_type_ind": pl.Utf8, "entity_type_text": pl.Utf8,
-        "entity_kind": pl.Utf8, "main_name": pl.Utf8, "main_name_type": pl.Utf8,
-        "individual_title": pl.Utf8, "individual_given_names": pl.Utf8,
-        "individual_family_name": pl.Utf8, "individual_name_type": pl.Utf8,
-        "state": pl.Utf8, "postcode": pl.Utf8, "asic_number": pl.Utf8,
-        "asic_number_type": pl.Utf8, "gst_status": pl.Utf8,
-        "gst_status_from_date": pl.Date,
-    })
-    history = bootstrap_main(main, date(2026, 5, 5))
-    write_history(tables["abn_main_history"], history, schema=ABN_MAIN_HISTORY_SCHEMA)
+def test_build_snapshot_manifest_lists_tables_with_data_files(tables, tmp_path):
+    overwrite_table_from_parquet(
+        tables["abn_main_history"],
+        _write_main_parquet([_main_row()], tmp_path / "w1.parquet"),
+    )
 
     out = build_snapshot_manifest(
         tables,
@@ -257,14 +230,12 @@ def test_build_snapshot_manifest_lists_tables_with_data_files(tables):
 
     assert out["iceberg_namespace"] == "abr_test"
     assert out["generated_at"] == "2026-05-05T04:15:00Z"
-    assert out["extract_time"] == "2026-05-05T03:00:00Z"
     main_block = out["tables"]["abn_main_history"]
     assert main_block["row_count"] == 1
     assert main_block["snapshot_id"] is not None
-    assert main_block["current_view_filter"] == "valid_to IS NULL"
+    # No more SCD2 view filter — table is current-state-only
+    assert "current_view_filter" not in main_block
     assert len(main_block["data_files"]) >= 1
-    # Local catalog uses file:// URLs — no s3:// prefix to translate.
-    # In production the URLs would start with https://gazetteer.au/...
     for url in main_block["data_files"]:
         assert url.endswith(".parquet")
 
@@ -274,223 +245,17 @@ def test_build_snapshot_manifest_lists_tables_with_data_files(tables):
     assert trading_block["data_files"] == []
 
 
-# Arrow + DuckDB SCD2 update path -------------------------------------------
-#
-# TEMPORARY: synthetic-data scaffolding.
-#
-# These tests use small in-memory rows to validate the SCD2 mechanics
-# (unchanged / changed / added / removed / set-membership) of
-# update_history_table_arrow against a local SQLite-backed iceberg catalog.
-# They cover the *correctness* side of the rewrite.
-#
-# The *real* validation is diffing the next weekly refresh's iceberg table
-# against the prior week — either whole or sliced — and confirming row
-# counts, open/closed transitions, and content equality match expectations.
-# Track the real-data validation in the follow-up issue; remove or shrink
-# this section once that lands.
-
-
-def _write_main_snapshot_parquet(rows: list[dict], path: Path) -> Path:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    pq.write_table(pa.Table.from_pylist(rows, schema=ABN_MAIN_SCHEMA), path)
-    return path
-
-
-def _write_trading_snapshot_parquet(rows: list[dict], path: Path) -> Path:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    pq.write_table(pa.Table.from_pylist(rows, schema=ABN_TRADING_NAMES_SCHEMA), path)
-    return path
-
-
-def test_update_history_table_arrow_unchanged_keeps_open_rows(tables, tmp_path):
-    snapshot = _main_row()
-    parquet_path = _write_main_snapshot_parquet([snapshot], tmp_path / "snap1.parquet")
-    bootstrap_history_table_arrow(
-        tables["abn_main_history"], parquet_path, date(2026, 5, 6)
-    )
-
-    parquet_path2 = _write_main_snapshot_parquet([snapshot], tmp_path / "snap2.parquet")
-    summary = update_history_table_arrow(
-        tables["abn_main_history"],
-        parquet_path2,
-        date(2026, 5, 13),
-        base_columns=list(ABN_MAIN_SCHEMA.names),
-        identity=list(MAIN_IDENTITY),
-        content_columns=list(MAIN_CONTENT_COLUMNS),
-    )
-    assert summary["mode"] == "update"
-    assert summary["rows_written"] == 1
-
-    table = tables["abn_main_history"]
-    table.refresh()
-    df = pl.from_arrow(table.scan().to_arrow())
-    assert df.height == 1
-    assert df["valid_to"].to_list() == [None]
-
-
-def test_update_history_table_arrow_changed_field_closes_old_opens_new(tables, tmp_path):
-    bootstrap_history_table_arrow(
-        tables["abn_main_history"],
-        _write_main_snapshot_parquet([_main_row(state="NSW")], tmp_path / "w1.parquet"),
-        date(2026, 5, 6),
-    )
-
-    update_history_table_arrow(
-        tables["abn_main_history"],
-        _write_main_snapshot_parquet([_main_row(state="VIC")], tmp_path / "w2.parquet"),
-        date(2026, 5, 13),
-        base_columns=list(ABN_MAIN_SCHEMA.names),
-        identity=list(MAIN_IDENTITY),
-        content_columns=list(MAIN_CONTENT_COLUMNS),
-    )
-
-    table = tables["abn_main_history"]
-    table.refresh()
-    df = pl.from_arrow(table.scan().to_arrow())
-    assert df.height == 2
-    closed = df.filter(pl.col("valid_to").is_not_null()).to_dicts()
-    open_rows = df.filter(pl.col("valid_to").is_null()).to_dicts()
-    assert len(closed) == 1 and closed[0]["state"] == "NSW"
-    assert closed[0]["valid_to"] == date(2026, 5, 13)
-    assert len(open_rows) == 1 and open_rows[0]["state"] == "VIC"
-    assert open_rows[0]["valid_from"] == date(2026, 5, 13)
-
-
-def test_update_history_table_arrow_added_and_removed(tables, tmp_path):
-    bootstrap_history_table_arrow(
-        tables["abn_main_history"],
-        _write_main_snapshot_parquet(
-            [_main_row(abn="11111111111"), _main_row(abn="22222222222")],
-            tmp_path / "w1.parquet",
-        ),
-        date(2026, 5, 6),
-    )
-
-    update_history_table_arrow(
-        tables["abn_main_history"],
-        _write_main_snapshot_parquet(
-            [_main_row(abn="11111111111"), _main_row(abn="33333333333")],
-            tmp_path / "w2.parquet",
-        ),
-        date(2026, 5, 13),
-        base_columns=list(ABN_MAIN_SCHEMA.names),
-        identity=list(MAIN_IDENTITY),
-        content_columns=list(MAIN_CONTENT_COLUMNS),
-    )
-
-    table = tables["abn_main_history"]
-    table.refresh()
-    df = pl.from_arrow(table.scan().to_arrow()).sort("abn")
-    rows = df.to_dicts()
-    by_abn = {r["abn"]: r for r in rows}
-    assert by_abn["11111111111"]["valid_to"] is None
-    assert by_abn["22222222222"]["valid_to"] == date(2026, 5, 13)
-    assert by_abn["33333333333"]["valid_to"] is None
-    assert by_abn["33333333333"]["valid_from"] == date(2026, 5, 13)
-
-
-def test_update_history_table_arrow_trading_set_membership(tables, tmp_path):
-    bootstrap_history_table_arrow(
-        tables["abn_trading_names_history"],
-        _write_trading_snapshot_parquet(
-            [
-                {"abn": "11111111111", "name": "ACME", "name_type": "BN"},
-                {"abn": "11111111111", "name": "ACME PRODUCTS", "name_type": "BN"},
-            ],
-            tmp_path / "t1.parquet",
-        ),
-        date(2026, 5, 6),
-        record_last_updated_column=None,
-    )
-
-    update_history_table_arrow(
-        tables["abn_trading_names_history"],
-        _write_trading_snapshot_parquet(
-            [
-                {"abn": "11111111111", "name": "ACME", "name_type": "BN"},
-                {"abn": "11111111111", "name": "ACME GLOBAL", "name_type": "BN"},
-            ],
-            tmp_path / "t2.parquet",
-        ),
-        date(2026, 5, 13),
-        base_columns=list(ABN_TRADING_NAMES_SCHEMA.names),
-        identity=list(TRADING_IDENTITY),
-        content_columns=list(TRADING_CONTENT_COLUMNS),
-    )
-
-    table = tables["abn_trading_names_history"]
-    table.refresh()
-    df = pl.from_arrow(table.scan().to_arrow()).sort(["name", "valid_from"])
-    rows = df.to_dicts()
-    names_seen = {r["name"] for r in rows}
-    assert names_seen == {"ACME", "ACME PRODUCTS", "ACME GLOBAL"}
-    closed = [r for r in rows if r["valid_to"] is not None]
-    assert len(closed) == 1
-    assert closed[0]["name"] == "ACME PRODUCTS"
-    assert closed[0]["valid_to"] == date(2026, 5, 13)
-
-
-def test_update_history_table_arrow_null_content_treated_consistently(tables, tmp_path):
-    """Hash-first SCD2 must treat (NULL, "ACT") the same on both sides.
-
-    Regression check for the hash-based content-equality path. If
-    DuckDB's hash() handled NULLs differently from prev to snapshot
-    (e.g., propagating NULL out of hash() instead of using a sentinel)
-    a row with a NULL content column on both sides would be mis-classified
-    as 'changed' instead of 'unchanged'.
-    """
-    bootstrap_history_table_arrow(
-        tables["abn_main_history"],
-        _write_main_snapshot_parquet(
-            [_main_row(individual_title=None, asic_number=None)],
-            tmp_path / "w1.parquet",
-        ),
-        date(2026, 5, 6),
-    )
-
-    update_history_table_arrow(
-        tables["abn_main_history"],
-        _write_main_snapshot_parquet(
-            [_main_row(individual_title=None, asic_number=None)],
-            tmp_path / "w2.parquet",
-        ),
-        date(2026, 5, 13),
-        base_columns=list(ABN_MAIN_SCHEMA.names),
-        identity=list(MAIN_IDENTITY),
-        content_columns=list(MAIN_CONTENT_COLUMNS),
-    )
-
-    table = tables["abn_main_history"]
-    table.refresh()
-    df = pl.from_arrow(table.scan().to_arrow())
-    assert df.height == 1
-    assert df["valid_to"].to_list() == [None]
-
-
-# Snapshot pruning ----------------------------------------------------------
+# --- snapshot pruning ----------------------------------------------------
 
 
 def test_prune_iceberg_snapshots_keeps_recent_n(tables, tmp_path):
     """After multiple weekly overwrites, pruning should leave only ``keep`` snapshots."""
     table = tables["abn_main_history"]
-    weeks = [
-        (date(2026, 5, 6), "NSW"),
-        (date(2026, 5, 13), "VIC"),
-        (date(2026, 5, 20), "QLD"),
-        (date(2026, 5, 27), "WA"),
-    ]
-    for i, (extract_date, st) in enumerate(weeks):
-        snapshot = pl.DataFrame([_main_row(state=st)])
-        history = bootstrap_main(snapshot, extract_date) if i == 0 else (
-            apply_update_main(
-                pl.from_arrow(table.scan().to_arrow()), snapshot, extract_date
-            )
+    for i in range(4):
+        overwrite_table_from_parquet(
+            table,
+            _write_main_parquet([_main_row(state=f"S{i}")], tmp_path / f"w{i}.parquet"),
         )
-        write_history(table, history, schema=ABN_MAIN_HISTORY_SCHEMA)
         table.refresh()
 
     pre_count = len(list(table.metadata.snapshots))
@@ -506,9 +271,9 @@ def test_prune_iceberg_snapshots_keeps_recent_n(tables, tmp_path):
 def test_prune_iceberg_snapshots_noop_when_under_threshold(tables, tmp_path):
     """A table with fewer snapshots than ``keep`` is left untouched."""
     table = tables["abn_main_history"]
-    snapshot = pl.DataFrame([_main_row()])
-    history = bootstrap_main(snapshot, date(2026, 5, 6))
-    write_history(table, history, schema=ABN_MAIN_HISTORY_SCHEMA)
+    overwrite_table_from_parquet(
+        table, _write_main_parquet([_main_row()], tmp_path / "w1.parquet")
+    )
     table.refresh()
 
     summary = prune_iceberg_snapshots(table, keep=5)

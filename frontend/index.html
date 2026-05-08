@@ -482,10 +482,6 @@
   // every name a user might search by. Avoids an ILIKE OR'd across four
   // columns + a trading-names sub-query on every keystroke.
   let SEARCH_SOURCE = '';
-  // SCD2 filter applied to every read of the history tables so only the
-  // currently-valid row per ABN is visible to the UI.
-  const CURRENT = 'valid_to IS NULL';
-
   function parquetSource(urls) {
     if (!urls || urls.length === 0) {
       throw new Error('No data files in iceberg-snapshot.json — has the pipeline run yet?');
@@ -621,10 +617,10 @@
   }
 
   async function fetchExtras(abn) {
-    const tStmt = await conn.prepare(`SELECT name, name_type FROM ${TRADING_SOURCE} WHERE ${CURRENT} AND abn = ? ORDER BY name_type, name`);
+    const tStmt = await conn.prepare(`SELECT name, name_type FROM ${TRADING_SOURCE} WHERE abn = ? ORDER BY name_type, name`);
     const trading = (await tStmt.query(abn)).toArray().map(r => r.toJSON());
     await tStmt.close();
-    const dStmt = await conn.prepare(`SELECT dgr_status_from_date AS "from", dgr_status, dgr_name FROM ${DGR_SOURCE} WHERE ${CURRENT} AND abn = ?`);
+    const dStmt = await conn.prepare(`SELECT dgr_status_from_date AS "from", dgr_status, dgr_name FROM ${DGR_SOURCE} WHERE abn = ?`);
     const dgr = (await dStmt.query(abn)).toArray().map(r => r.toJSON());
     await dStmt.close();
     return { trading, dgr };

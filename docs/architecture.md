@@ -154,10 +154,13 @@ GitHub Actions (cron Sun 04:00 UTC, or manual workflow_dispatch)
    ▼
 [5] _run_iceberg_step                         3 tables sequentially
    │  for each in (main, trading, dgr):
-   │    if iceberg empty: bootstrap_history_table_arrow
-   │    else:             update_history_table_arrow (DuckDB SCD2)
-   │    prune_iceberg_snapshots(keep=2)
+   │    overwrite_table_from_parquet(table, snapshot_parquet)
+   │    prune_iceberg_snapshots(keep=26)   # ~6 months of weekly snapshots
    │  writes __r2_data_catalog/<ns>/<table>/{data,metadata}/...
+   │
+   │  Tables are current-state-only (no SCD2). Iceberg's own snapshot
+   │  history is the time-travel mechanism: 26 retained snapshots ≈
+   │  6 months of weekly point-in-time reads via FOR SYSTEM_VERSION AS OF.
    ▼
 [6] search_index.build_search_index           DuckDB join over main+trading
    │  writes ./work/abn-search.parquet
@@ -281,11 +284,11 @@ Inventory will be re-reconciled then.
 |---|---|---|---|---|
 | `iceberg-snapshot.json` exists at root | Missing | Present, refreshed weekly | Triggered refresh in flight; diagnostics from #20 will surface any failure | #18 |
 | Static dumps deleted, no re-upload | ~~Off-repo, opaque~~ Deleted 2026-05-08 | No re-upload from any source | Local-machine check still pending | #23 (active reminder) |
-| Snapshot metadata bounded | Bounded via `prune_iceberg_snapshots(keep=2)` | Same | — | ✅ shipped on `master` |
+| Snapshot metadata bounded | Bounded via `prune_iceberg_snapshots(keep=26)` | Same | — | ✅ shipped on `master` |
 | Snapshot data file orphans cleaned | Will accumulate as snapshots expire | Periodic S3-list-and-diff cleanup | PyIceberg has no built-in; need homegrown | #13 |
 | `abr_test` namespace lingers | Yes | Tear down post-test | Code change in CLI | New issue (file from #21) |
 | Failed pipeline runs are diagnosable | Stage marker + dmesg + artifact | Same | — | ✅ shipped on `master` (#20 closed) |
-| SCD2 path validated against real data | Synthetic only | Whole or sliced real-data validation | Need next weekly refresh + diff script | #19 |
+| SCD2 row-level history vs Iceberg snapshot history | ~~SCD2 columns held row-level history; cost was 80+ min iceberg update step at 20M rows~~ | Iceberg snapshot history at table level (26 retained = ~6 months) | — | #32 (drop SCD2) |
 | SQLite materialisation is fast | `sqlite3.executemany` Python loop | DuckDB `sqlite` extension | Code change | #2 |
 | LICENSE detectable on GitHub | No `LICENSE` file | Standard MIT `LICENSE` at root | One-shot file add | #16 |
 | ABN/ACN cells link out | Plain text | ABR Lookup + OpenCorporates anchors | Frontend change | #14 |
@@ -328,25 +331,25 @@ the parquet datasets. End-to-end timing is not measured in this repo.
 This section describes the *shape* of current vs. post-search-index
 queries; quantitative comparison waits on measurement post-#22.
 
-### 11.1 Current shape (master)
+### 11.1 Current shape (master, post-#32)
 
 `frontend/index.html` issues, on every keystroke, a query of roughly the
 form:
 
 ```sql
 SELECT … FROM read_parquet([..main data files..]) main
-WHERE valid_to IS NULL
-  AND (
-    main_name                  ILIKE ?
-    OR individual_family_name  ILIKE ?
-    OR individual_given_names  ILIKE ?
-    OR abn IN (
-      SELECT abn FROM read_parquet([..trading data files..])
-      WHERE valid_to IS NULL AND name ILIKE ?
-    )
-  )
+WHERE main_name                  ILIKE ?
+   OR individual_family_name     ILIKE ?
+   OR individual_given_names     ILIKE ?
+   OR abn IN (
+     SELECT abn FROM read_parquet([..trading data files..])
+     WHERE name ILIKE ?
+   )
 LIMIT …
 ```
+
+(SCD2 `valid_to IS NULL` filter removed in #32 — the iceberg tables
+are current-state-only by design now.)
 
 Four ILIKE comparisons. Two parquet relations scanned. Per-row
 `LOWER()` coercion. The trading sub-query is re-evaluated each
