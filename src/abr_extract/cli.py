@@ -12,23 +12,21 @@ import click
 from .catalog import fetch_catalog
 from .download import download_all
 from .history import (
-    apply_update_dgr,
-    apply_update_main,
-    apply_update_trading,
-    bootstrap_dgr,
-    bootstrap_main,
-    bootstrap_trading,
+    DGR_CONTENT_COLUMNS,
+    DGR_IDENTITY,
+    MAIN_CONTENT_COLUMNS,
+    MAIN_IDENTITY,
+    TRADING_CONTENT_COLUMNS,
+    TRADING_IDENTITY,
 )
 from .iceberg_io import (
-    ABN_DGR_HISTORY_SCHEMA,
-    ABN_MAIN_HISTORY_SCHEMA,
-    ABN_TRADING_HISTORY_SCHEMA,
     bootstrap_history_table_arrow,
     build_snapshot_manifest,
     connect_r2_catalog,
     ensure_history_tables,
     load_iceberg_settings_from_env,
-    update_history_table,
+    prune_iceberg_snapshots,
+    update_history_table_arrow,
 )
 from .parallel import (
     DEFAULT_WORKERS,
@@ -312,13 +310,10 @@ def _run_iceberg_step(
 ) -> dict:
     """Apply SCD2 update to the three Iceberg history tables on R2 Data Catalog.
 
-    For empty tables (bootstrap case — first run on a namespace) we use the
-    streaming pyarrow fast path which avoids materialising the whole
-    snapshot in Polars. For tables with existing history we fall back to
-    the polars-driven SCD2 reconciliation since the joins are expressed
-    against polars DataFrames.
-
-    Returns a summary dict per relation for the manifest.
+    Both bootstrap (empty table) and update (table has prior data) paths go
+    through pyarrow / DuckDB — no Polars round-trip on the multi-GB main
+    relation. After each table's overwrite we prune older Iceberg snapshots
+    so the snapshot log doesn't grow unbounded.
     """
     import gc
 
@@ -329,37 +324,34 @@ def _run_iceberg_step(
     tables = ensure_history_tables(catalog, namespace=namespace)
 
     summary: dict = {}
-    for table_key, parquet_path, schema, bootstrap_fn, apply_fn, src_record_col in (
+    for table_key, parquet_path, snapshot_schema, identity, content_columns, src_record_col in (
         (
             "abn_main_history",
             paths.main_parquet,
-            ABN_MAIN_HISTORY_SCHEMA,
-            bootstrap_main,
-            apply_update_main,
+            ABN_MAIN_SCHEMA,
+            list(MAIN_IDENTITY),
+            list(MAIN_CONTENT_COLUMNS),
             "record_last_updated",
         ),
         (
             "abn_trading_names_history",
             paths.trading_parquet,
-            ABN_TRADING_HISTORY_SCHEMA,
-            bootstrap_trading,
-            apply_update_trading,
+            ABN_TRADING_NAMES_SCHEMA,
+            list(TRADING_IDENTITY),
+            list(TRADING_CONTENT_COLUMNS),
             None,
         ),
         (
             "abn_dgr_history",
             paths.dgr_parquet,
-            ABN_DGR_HISTORY_SCHEMA,
-            bootstrap_dgr,
-            apply_update_dgr,
+            ABN_DGR_SCHEMA,
+            list(DGR_IDENTITY),
+            list(DGR_CONTENT_COLUMNS),
             None,
         ),
     ):
         ice_table = tables[table_key]
         ice_table.refresh()
-        # Cheap probe: does the iceberg table already have a snapshot?
-        # current_snapshot() returns None on empty tables (no rows ever
-        # written). If empty, take the arrow fast path.
         is_empty = ice_table.current_snapshot() is None
 
         if is_empty:
@@ -370,17 +362,23 @@ def _run_iceberg_step(
                 record_last_updated_column=src_record_col,
             )
         else:
-            import polars as pl
-            snapshot_df = pl.read_parquet(parquet_path)
-            summary[table_key] = update_history_table(
+            summary[table_key] = update_history_table_arrow(
                 ice_table,
-                snapshot_df,
+                parquet_path,
                 extract_date,
-                bootstrap_fn=bootstrap_fn,
-                apply_fn=apply_fn,
-                schema=schema,
+                base_columns=list(snapshot_schema.names),
+                identity=identity,
+                content_columns=content_columns,
             )
-            del snapshot_df
+
+        # Prune snapshot metadata so the on-R2 snapshot log doesn't grow
+        # unbounded. Physical orphan-file deletion is handled separately
+        # (see the storage cleanup issue) — pyiceberg 0.11 only updates
+        # metadata here, not S3 objects.
+        ice_table.refresh()
+        prune = prune_iceberg_snapshots(ice_table)
+        summary[table_key]["pruned_snapshots"] = prune
+
         gc.collect()
     return summary
 
