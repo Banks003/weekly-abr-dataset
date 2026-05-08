@@ -24,18 +24,13 @@ A precomputed search index for keystroke-fast filtering is also published:
 
 - `https://gazetteer.au/abn-search-latest.parquet` — one row per ABN with display columns and a denormalised, lowercased `search_text`. Used by the frontend for the search filter; useful for any consumer that just wants name lookups without joining main + trading.
 
-### Legacy static dumps (under review)
+### Legacy static dumps (removed 2026-05-08)
 
-```
-https://gazetteer.au/abn-main-latest.parquet
-https://gazetteer.au/abn-trading-names-latest.parquet
-https://gazetteer.au/abn-dgr-latest.parquet
-https://gazetteer.au/abr-extract-latest.sqlite
-```
+The pre-Iceberg `abn-main-latest.parquet`, `abn-trading-names-latest.parquet`, `abn-dgr-latest.parquet`, and `abr-extract-latest.sqlite` URLs at the bucket root **no longer resolve**. The `manifest.json` + `iceberg-snapshot.json` pointers above (plus the search index) are the supported interface going forward.
 
-These predate the Iceberg switch. They're being reviewed as part of [#13](https://github.com/Banks003/weekly-abr-dataset/issues/13) — the long-term answer is "Iceberg + search index for live use, one frozen archival dump for back-compat". If you depend on these URLs, comment on #13 so we don't break you.
+If you depended on those URLs, the iceberg + search-index path covers the same use cases — see Usage below — and `joelkoen/simple-abns`-style consumers can read the same columns out of the iceberg data files. Discussion: [#13](https://github.com/Banks003/weekly-abr-dataset/issues/13).
 
-Each refresh also writes a date-stamped copy of `manifest.json`, `iceberg-snapshot.json`, and `abn-search-latest.parquet` (e.g. `manifest-2026-05-08.json`) for audit history.
+Each refresh writes a date-stamped audit copy of `manifest.json`, `iceberg-snapshot.json`, and `abn-search-latest.parquet` (e.g. `manifest-2026-05-08.json`) at the bucket root.
 
 ### Schema
 
@@ -80,16 +75,6 @@ df = con.execute(f"""
     WHERE valid_to IS NULL AND state = 'VIC' AND gst_status = 'ACT'
     LIMIT 10
 """).fetchdf()
-```
-
-### Legacy direct-parquet path
-
-The historical `abn-main-latest.parquet` URL still resolves, pending [#13](https://github.com/Banks003/weekly-abr-dataset/issues/13):
-
-```python
-import polars as pl
-
-df = pl.read_parquet("https://gazetteer.au/abn-main-latest.parquet")
 ```
 
 ## Architecture
