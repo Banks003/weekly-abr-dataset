@@ -2,12 +2,16 @@
 
 Production target: R2 Data Catalog (REST catalog + R2 object storage). Local
 tests use PyIceberg's SQL catalog backed by SQLite + a temp directory, so
-the SCD2 logic and Iceberg writes are tested without touching R2.
+the overwrite + snapshot management are tested without touching R2.
 
-The history.py module produces the full reconciled SCD2 DataFrame each
-week. This module's write_history overwrites the corresponding Iceberg
-table with that DataFrame — simple and correct. Iceberg snapshots provide
-the table-level time-travel; the SCD2 columns provide row-level history.
+Each weekly refresh does a single ``table.overwrite`` per relation. The
+table content is the *current state* of the ABR extract — no SCD2 columns,
+no row-level history. Iceberg's own snapshot history (one snapshot per
+weekly overwrite, retained per ``prune_iceberg_snapshots(keep=...)``) is
+the time-travel mechanism: ``SELECT * FROM table FOR SYSTEM_VERSION AS OF
+<snapshot_id>`` answers "what did this look like on date X" at
+table-granularity, which covers the use cases that the dropped SCD2
+columns used to cover at row-granularity.
 """
 
 from __future__ import annotations
@@ -18,7 +22,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import polars as pl
 from pyiceberg.catalog import Catalog, load_catalog
 from pyiceberg.exceptions import NoSuchTableError
 from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC
@@ -30,7 +33,9 @@ from pyiceberg.types import (
     StringType,
 )
 
-# Schemas mirror schema.py's pyarrow schemas plus SCD2 columns.
+# Schemas mirror schema.py's pyarrow schemas — same columns, no SCD2.
+# The "_history" suffix on the table names is preserved (Iceberg snapshot
+# history *is* the history at this point).
 
 ABN_MAIN_HISTORY_SCHEMA = Schema(
     NestedField(1, "abn", StringType(), required=True),
@@ -53,18 +58,12 @@ ABN_MAIN_HISTORY_SCHEMA = Schema(
     NestedField(18, "asic_number_type", StringType()),
     NestedField(19, "gst_status", StringType()),
     NestedField(20, "gst_status_from_date", DateType()),
-    NestedField(21, "valid_from", DateType(), required=True),
-    NestedField(22, "valid_to", DateType()),
-    NestedField(23, "snapshot_observed_date", DateType(), required=True),
 )
 
 ABN_TRADING_HISTORY_SCHEMA = Schema(
     NestedField(1, "abn", StringType(), required=True),
     NestedField(2, "name", StringType(), required=True),
     NestedField(3, "name_type", StringType()),
-    NestedField(4, "valid_from", DateType(), required=True),
-    NestedField(5, "valid_to", DateType()),
-    NestedField(6, "snapshot_observed_date", DateType(), required=True),
 )
 
 ABN_DGR_HISTORY_SCHEMA = Schema(
@@ -72,9 +71,6 @@ ABN_DGR_HISTORY_SCHEMA = Schema(
     NestedField(2, "dgr_status_from_date", DateType()),
     NestedField(3, "dgr_status", StringType()),
     NestedField(4, "dgr_name", StringType()),
-    NestedField(5, "valid_from", DateType(), required=True),
-    NestedField(6, "valid_to", DateType()),
-    NestedField(7, "snapshot_observed_date", DateType(), required=True),
 )
 
 
@@ -154,29 +150,37 @@ def ensure_namespace(catalog: Catalog, namespace: str) -> None:
         catalog.create_namespace(namespace)
 
 
+def _schemas_match(existing: Schema, target: Schema) -> bool:
+    """True if both schemas have the same set of (name, field type, required)."""
+    e = {(f.name, str(f.field_type), f.required) for f in existing.fields}
+    t = {(f.name, str(f.field_type), f.required) for f in target.fields}
+    return e == t
+
+
 def ensure_table(catalog: Catalog, namespace: str, name: str, schema: Schema) -> Table:
+    """Load or create the named table; drop and recreate on schema mismatch.
+
+    The schema-mismatch detection makes the SCD2 → current-state migration
+    automatic on first run. An existing ``abn_main_history`` table from
+    the SCD2 era will have ``valid_from`` / ``valid_to`` /
+    ``snapshot_observed_date`` fields that the new schema lacks —
+    ``_schemas_match`` returns False, the catalog drops the old table,
+    and a fresh table is created with the new schema. Iceberg snapshot
+    history starts fresh from the next overwrite.
+    """
     full = f"{namespace}.{name}"
     try:
-        return catalog.load_table(full)
+        existing = catalog.load_table(full)
     except NoSuchTableError:
         return catalog.create_table(
-            full,
-            schema=schema,
-            partition_spec=UNPARTITIONED_PARTITION_SPEC,
+            full, schema=schema, partition_spec=UNPARTITIONED_PARTITION_SPEC
         )
-
-
-def write_history(table: Table, df: pl.DataFrame, *, schema: Schema) -> None:
-    """Replace the table contents with df.
-
-    Simple semantics: overwrite the whole table each weekly run. The SCD2
-    logic in history.py produces the full reconciled DataFrame, so this is
-    correct. Iceberg snapshot history gives us coarse table-level time
-    travel; the valid_from / valid_to columns give row-level history.
-    """
-    arrow_schema = schema.as_arrow()
-    arrow = df.to_arrow().cast(arrow_schema)
-    table.overwrite(arrow)
+    if _schemas_match(existing.schema(), schema):
+        return existing
+    catalog.drop_table(full)
+    return catalog.create_table(
+        full, schema=schema, partition_spec=UNPARTITIONED_PARTITION_SPEC
+    )
 
 
 def ensure_history_tables(catalog: Catalog, namespace: str = "abr") -> dict[str, Table]:
@@ -206,7 +210,7 @@ def build_snapshot_manifest(
     bucket: str,
     public_base_url: str,
 ) -> dict:
-    """Build the ``iceberg-snapshot.json`` payload for a set of history tables.
+    """Build the ``iceberg-snapshot.json`` payload for a set of tables.
 
     For each table this enumerates the live data files via
     ``table.scan().plan_files()``, translates ``s3://`` paths to public URLs,
@@ -214,9 +218,8 @@ def build_snapshot_manifest(
     current snapshot id.
 
     The frontend consumes this so it can read DuckDB-WASM ``read_parquet``
-    against the live Iceberg data files. ``current_view_filter`` tells the
-    UI which SCD2 clause to apply for the "currently valid" view of each
-    history relation (``valid_to IS NULL``).
+    against the live Iceberg data files. Tables are now current-state-only
+    (no SCD2), so no per-table SCD2 view filter is needed.
     """
     out: dict = {
         "generated_at": generated_at,
@@ -240,228 +243,53 @@ def build_snapshot_manifest(
             "snapshot_id": snap_id,
             "data_files": urls,
             "row_count": row_count,
-            "current_view_filter": "valid_to IS NULL",
         }
     return out
 
 
-# Bootstrap (empty-table) path ----------------------------------------------
+# Overwrite path -------------------------------------------------------------
 
-def bootstrap_history_table_arrow(
+def overwrite_table_from_parquet(
     table: Table,
     parquet_path,
-    extract_date,
-    *,
-    record_last_updated_column: str | None = "record_last_updated",
 ) -> dict:
-    """One-shot bootstrap an Iceberg history table from a snapshot Parquet.
+    """Overwrite an Iceberg table with the contents of a parquet file.
 
-    Reads the whole snapshot parquet to a pyarrow Table (cheaper than the
-    polars round-trip — pyarrow holds the column-oriented buffers near
-    the parquet native format, while polars copies them into its own
-    representation, roughly doubling memory). Adds the three SCD2 columns
-    via zero-copy ``append_column`` calls, casts once to the iceberg
-    arrow schema, and calls ``table.overwrite`` exactly once — a single
-    iceberg snapshot, no per-batch R2 commit overhead.
+    Reads the parquet to a pyarrow Table (cheaper than the polars
+    round-trip — pyarrow holds the column-oriented buffers near the
+    parquet native format), casts to the iceberg arrow schema, and calls
+    ``table.overwrite`` exactly once. Single iceberg snapshot per call.
 
-    Memory peaks at roughly the size of the snapshot parquet decompressed
-    (~1-2GB for the main relation), which is half the polars path's peak
-    and well within the 16GB ubuntu-latest runner''s headroom.
+    Memory peaks at roughly the size of the parquet decompressed
+    (~1-2 GB for the main relation).
     """
-    import pyarrow as pa
-    import pyarrow.compute as pc
     import pyarrow.parquet as pq
 
     arrow_table = pq.read_table(parquet_path)
     n = arrow_table.num_rows
-
-    extract_date_array = pa.array([extract_date] * n, type=pa.date32())
-    null_date_array = pa.nulls(n, type=pa.date32())
-
-    if (
-        record_last_updated_column
-        and record_last_updated_column in arrow_table.column_names
-    ):
-        valid_from = pc.coalesce(
-            arrow_table.column(record_last_updated_column),
-            extract_date_array,
-        )
-    else:
-        valid_from = extract_date_array
-
-    arrow_table = arrow_table.append_column("valid_from", valid_from)
-    arrow_table = arrow_table.append_column("valid_to", null_date_array)
-    arrow_table = arrow_table.append_column(
-        "snapshot_observed_date", extract_date_array
-    )
     arrow_table = arrow_table.cast(table.schema().as_arrow())
-
     table.overwrite(arrow_table)
-
-    return {"mode": "bootstrap", "rows_written": n, "batches": 1}
-
-
-# Arrow + DuckDB SCD2 update path -------------------------------------------
-
-
-def _scd2_update_sql(
-    *,
-    base_columns: list[str],
-    identity: list[str],
-    content_columns: list[str],
-) -> str:
-    """Build the SCD2 reconciliation SQL for one history table.
-
-    Hash-first strategy: compute a content hash per row in tiny
-    ``(identity, _h)`` projections of prev_open and snapshot, then do
-    the FULL OUTER JOIN on those two-column relations. The join's hash
-    table holds only ~30 bytes per row instead of the full wide row,
-    which lets DuckDB process 20M-row main relations on a 16 GB runner
-    without spilling the heavy content columns.
-
-    The classification is then re-joined back to the full source rows
-    only at emit time, where each leg is a simple inner-join filter.
-
-    Inputs registered in the DuckDB connection: ``prev`` (full prior
-    history with SCD2 columns) and ``snapshot`` (the new weekly snapshot,
-    base columns only). Bind parameters in order: ``valid_to`` for closed
-    rows, ``valid_from`` and ``snapshot_observed_date`` for new versions.
-    """
-    base_select = ", ".join(base_columns)
-    id_select = ", ".join(f'"{c}"' for c in identity)
-    id_join = " AND ".join(f'p."{c}" = n."{c}"' for c in identity)
-    id_using = ", ".join(f'"{c}"' for c in identity)
-    id_first = f'"{identity[0]}"'
-
-    if content_columns:
-        # DuckDB's hash() is order-sensitive across multiple args; same arg
-        # tuple → same UBIGINT on both sides. NULLs hash to a deterministic
-        # sentinel, so a (NULL, "ACT") row on prev hashes the same as a
-        # (NULL, "ACT") row on snapshot — content-equal.
-        content_hash_expr = "hash(" + ", ".join(f'"{c}"' for c in content_columns) + ")"
-    else:
-        # Pure set-membership tables (trading_names): identity match is
-        # always content-equal. Constant collapses the case to "matched".
-        content_hash_expr = "0::BIGINT"
-
-    return f"""
-    WITH
-    prev_open AS (SELECT * FROM prev WHERE valid_to IS NULL),
-    prev_closed AS (SELECT * FROM prev WHERE valid_to IS NOT NULL),
-    prev_keyed AS (
-      SELECT {id_select}, {content_hash_expr} AS _h
-      FROM prev_open
-    ),
-    new_keyed AS (
-      SELECT {id_select}, {content_hash_expr} AS _h
-      FROM snapshot
-    ),
-    classified AS (
-      SELECT
-        {", ".join(f'coalesce(p."{c}", n."{c}") AS "{c}"' for c in identity)},
-        CASE
-          WHEN p.{id_first} IS NULL THEN 'added'
-          WHEN n.{id_first} IS NULL THEN 'removed'
-          WHEN p._h = n._h           THEN 'unchanged'
-          ELSE 'changed'
-        END AS _action
-      FROM prev_keyed p
-      FULL OUTER JOIN new_keyed n ON {id_join}
-    )
-    SELECT * FROM prev_closed
-    UNION ALL BY NAME
-    SELECT po.* FROM prev_open po
-      JOIN classified cls USING ({id_using})
-      WHERE cls._action = 'unchanged'
-    UNION ALL BY NAME
-    SELECT po.* REPLACE (CAST(? AS DATE) AS valid_to)
-      FROM prev_open po
-      JOIN classified cls USING ({id_using})
-      WHERE cls._action IN ('changed', 'removed')
-    UNION ALL BY NAME
-    SELECT
-      {base_select},
-      CAST(? AS DATE) AS valid_from,
-      CAST(NULL AS DATE) AS valid_to,
-      CAST(? AS DATE) AS snapshot_observed_date
-    FROM snapshot n
-      JOIN classified cls USING ({id_using})
-      WHERE cls._action IN ('changed', 'added')
-    """
-
-
-def update_history_table_arrow(
-    table: Table,
-    snapshot_parquet_path,
-    extract_date,
-    *,
-    base_columns: list[str],
-    identity: list[str],
-    content_columns: list[str],
-    duckdb_memory_limit: str = "8GB",
-    duckdb_temp_dir: str | None = None,
-) -> dict:
-    """SCD2 update via Arrow + DuckDB. No Polars round-trip.
-
-    Reads prior history from the Iceberg table as an Arrow record-batch
-    reader, reads the new snapshot parquet directly with DuckDB, executes
-    the SCD2 reconciliation SQL, and writes the result back via
-    ``table.overwrite``.
-    """
-    import duckdb
-
-    table.refresh()
-    prev_reader = table.scan().to_arrow_batch_reader()
-
-    con = duckdb.connect(":memory:")
-    try:
-        con.execute(f"PRAGMA memory_limit='{duckdb_memory_limit}'")
-        if duckdb_temp_dir:
-            con.execute(f"PRAGMA temp_directory='{duckdb_temp_dir}'")
-        con.register("prev", prev_reader)
-        # Materialise the snapshot via DuckDB's native parquet reader so the
-        # SCD2 query can reference it twice (key_action + final SELECT)
-        # without re-decoding the file.
-        con.execute(
-            "CREATE TEMP TABLE snapshot AS "
-            "SELECT * FROM read_parquet(?)",
-            [str(snapshot_parquet_path)],
-        )
-
-        sql = _scd2_update_sql(
-            base_columns=base_columns,
-            identity=identity,
-            content_columns=content_columns,
-        )
-        result = con.execute(sql, [extract_date, extract_date, extract_date]).to_arrow_table()
-    finally:
-        con.close()
-
-    arrow = result.cast(table.schema().as_arrow())
-    n = arrow.num_rows
-    table.overwrite(arrow)
-
-    return {"mode": "update", "rows_written": n}
+    return {"rows_written": n}
 
 
 # Snapshot pruning ----------------------------------------------------------
 #
 # Iceberg's ``table.overwrite`` writes a fresh snapshot pointing at new
 # data files; the previous snapshot's data files stay on R2 indefinitely
-# unless we explicitly expire and clean them up. Without pruning, R2
-# storage grows by ~770MB (main) + smaller (trading + dgr) every week
-# even though the live row count is constant.
+# unless we explicitly expire and clean them up.
 #
 # ``expire_snapshots`` here is a *metadata* operation: it removes expired
 # snapshots from the table's snapshot log so they're no longer reachable
 # via time-travel. Physically deleting the orphaned data files from R2
 # requires a separate listing pass (PyIceberg 0.11 has no built-in
-# orphan-file remover); see docs in the cleanup issue for the one-shot
-# script. Running ``expire_snapshots`` on every refresh keeps the
-# snapshot log bounded so future orphan-file passes don't have to chase
-# a runaway list.
+# orphan-file remover); see the cleanup tracker. Running
+# ``expire_snapshots`` on every refresh keeps the snapshot log bounded.
+#
+# Now that Iceberg snapshots *are* the time-travel mechanism (no SCD2),
+# we keep more of them — the default has been bumped to 26 (six months
+# of weekly snapshots).
 
-DEFAULT_SNAPSHOT_KEEP = 2
+DEFAULT_SNAPSHOT_KEEP = 26
 
 
 def prune_iceberg_snapshots(

@@ -8,29 +8,20 @@ import threading
 import time
 import uuid
 import zipfile
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import click
 
 from .catalog import fetch_catalog
 from .download import download_all
-from .history import (
-    DGR_CONTENT_COLUMNS,
-    DGR_IDENTITY,
-    MAIN_CONTENT_COLUMNS,
-    MAIN_IDENTITY,
-    TRADING_CONTENT_COLUMNS,
-    TRADING_IDENTITY,
-)
 from .iceberg_io import (
-    bootstrap_history_table_arrow,
     build_snapshot_manifest,
     connect_r2_catalog,
     ensure_history_tables,
     load_iceberg_settings_from_env,
+    overwrite_table_from_parquet,
     prune_iceberg_snapshots,
-    update_history_table_arrow,
 )
 from .parallel import (
     DEFAULT_WORKERS,
@@ -515,79 +506,41 @@ def run(
 def _run_iceberg_step(
     paths: WriterPaths, *, extract_date_iso: str, namespace: str = "abr"
 ) -> dict:
-    """Apply SCD2 update to the three Iceberg history tables on R2 Data Catalog.
+    """Overwrite each Iceberg table from the merged snapshot parquet.
 
-    Both bootstrap (empty table) and update (table has prior data) paths go
-    through pyarrow / DuckDB — no Polars round-trip on the multi-GB main
-    relation. After each table's overwrite we prune older Iceberg snapshots
-    so the snapshot log doesn't grow unbounded.
+    Tables are current-state-only — no SCD2 columns, no prev-vs-new join.
+    Each weekly run is a single ``table.overwrite`` per relation. Iceberg's
+    own snapshot history (retained by ``prune_iceberg_snapshots``) is the
+    time-travel mechanism.
+
+    On first run after the SCD2 → current-state migration, ``ensure_table``
+    detects the schema mismatch and drops + recreates each table; the new
+    snapshot history starts fresh from this run.
     """
     import gc
 
-    extract_date = date.fromisoformat(extract_date_iso)
+    # extract_date_iso is currently unused (no SCD2 columns to stamp), but
+    # retained for symmetry with the other pipeline steps and for possible
+    # future use (e.g. a single ``last_seen_date`` column).
+    _ = extract_date_iso
 
     iceberg_settings = load_iceberg_settings_from_env()
     catalog = connect_r2_catalog(iceberg_settings)
     tables = ensure_history_tables(catalog, namespace=namespace)
 
     summary: dict = {}
-    for table_key, parquet_path, snapshot_schema, identity, content_columns, src_record_col in (
-        (
-            "abn_main_history",
-            paths.main_parquet,
-            ABN_MAIN_SCHEMA,
-            list(MAIN_IDENTITY),
-            list(MAIN_CONTENT_COLUMNS),
-            "record_last_updated",
-        ),
-        (
-            "abn_trading_names_history",
-            paths.trading_parquet,
-            ABN_TRADING_NAMES_SCHEMA,
-            list(TRADING_IDENTITY),
-            list(TRADING_CONTENT_COLUMNS),
-            None,
-        ),
-        (
-            "abn_dgr_history",
-            paths.dgr_parquet,
-            ABN_DGR_SCHEMA,
-            list(DGR_IDENTITY),
-            list(DGR_CONTENT_COLUMNS),
-            None,
-        ),
+    for table_key, parquet_path in (
+        ("abn_main_history", paths.main_parquet),
+        ("abn_trading_names_history", paths.trading_parquet),
+        ("abn_dgr_history", paths.dgr_parquet),
     ):
         ice_table = tables[table_key]
-        ice_table.refresh()
-        is_empty = ice_table.current_snapshot() is None
-
-        stage_label = f"iceberg.{table_key} ({'bootstrap' if is_empty else 'update'})"
+        stage_label = f"iceberg.{table_key} (overwrite)"
         with _stage(stage_label), _heartbeat(stage_label, every_seconds=30.0):
-            if is_empty:
-                summary[table_key] = bootstrap_history_table_arrow(
-                    ice_table,
-                    parquet_path,
-                    extract_date,
-                    record_last_updated_column=src_record_col,
-                )
-            else:
-                summary[table_key] = update_history_table_arrow(
-                    ice_table,
-                    parquet_path,
-                    extract_date,
-                    base_columns=list(snapshot_schema.names),
-                    identity=identity,
-                    content_columns=content_columns,
-                )
-
-            # Prune snapshot metadata so the on-R2 snapshot log doesn't grow
-            # unbounded. Physical orphan-file deletion is handled separately
-            # (see the storage cleanup issue) — pyiceberg 0.11 only updates
-            # metadata here, not S3 objects.
+            summary[table_key] = overwrite_table_from_parquet(ice_table, parquet_path)
             ice_table.refresh()
             prune = prune_iceberg_snapshots(ice_table)
             summary[table_key]["pruned_snapshots"] = prune
-
             gc.collect()
     return summary
 
