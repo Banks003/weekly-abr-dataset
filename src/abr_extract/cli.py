@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import sys
+import threading
 import time
 import uuid
 import zipfile
@@ -52,57 +55,140 @@ from .schema import (
 from .search_index import build_search_index
 from .write import WriterBundle, WriterPaths, build_manifest, write_manifest
 
+logger = logging.getLogger(__name__)
+
+
+def _configure_logging(level: int = logging.INFO) -> None:
+    """Configure the root logger for the CLI.
+
+    Idempotent: ``logging.basicConfig`` only configures on first call,
+    so importing the module from tests doesn't override their logging
+    setup. Format: ``YYYY-MM-DD HH:MM:SS module.name LEVEL message``.
+    Handler is stdout-only (works in GitHub Actions log without extra
+    plumbing).
+    """
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stdout,
+    )
+
+
+def _rss_gb() -> str:
+    """Best-effort peak RSS in GB. Returns '?' on any error.
+
+    Linux ``ru_maxrss`` is in KB; CI runner is Linux. This is peak RSS
+    (monotonic) not current — useful for "we hit X at some point" not
+    "we are using X right now".
+    """
+    try:
+        import resource
+
+        kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return f"{kb / 1e6:.2f} GB"
+    except Exception:
+        return "?"
+
 
 class _Stage:
     """Stage marker context manager for the pipeline.
 
-    Prints ``[stage] <name> starting (rss=X GB)`` on entry and
+    Logs ``[stage] <name> starting (rss=X GB)`` on entry and
     ``[stage] <name> done in Ns (rss=Y GB)`` on clean exit, or
-    ``[stage] <name> FAILED after Ns ...`` on exception. Output goes to
-    stderr so it interleaves cleanly with the regular stdout chatter.
+    ``[stage] <name> FAILED after Ns ...`` on exception.
 
-    The whole point is that the *last printed line* before any silent
-    SIGKILL identifies which stage owned the failure.
+    The whole point is that the *last logged line* before any silent
+    SIGKILL identifies which stage owned the failure. For long stages
+    (>30s), pair with :class:`_Heartbeat` so the silence between
+    starting and done isn't itself a question mark.
     """
 
     def __init__(self, name: str) -> None:
         self.name = name
         self.start = 0.0
 
-    def _rss_gb(self) -> str:
-        # Linux ru_maxrss is in KB; CI runner is Linux. Falls back to
-        # "?" on any error — diagnostic plumbing must never mask the
-        # real failure.
-        try:
-            import resource
-
-            kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            return f"{kb / 1e6:.2f} GB"
-        except Exception:
-            return "?"
-
     def __enter__(self) -> _Stage:
         self.start = time.monotonic()
-        click.echo(f"[stage] {self.name} starting (rss={self._rss_gb()})", err=True)
+        logger.info("[stage] %s starting (rss=%s)", self.name, _rss_gb())
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         duration = time.monotonic() - self.start
         if exc_type is None:
-            click.echo(
-                f"[stage] {self.name} done in {duration:.1f}s (rss={self._rss_gb()})",
-                err=True,
+            logger.info(
+                "[stage] %s done in %.1fs (rss=%s)",
+                self.name,
+                duration,
+                _rss_gb(),
             )
         else:
-            click.echo(
-                f"[stage] {self.name} FAILED after {duration:.1f}s "
-                f"(rss={self._rss_gb()}): {exc_type.__name__}",
-                err=True,
+            logger.error(
+                "[stage] %s FAILED after %.1fs (rss=%s): %s",
+                self.name,
+                duration,
+                _rss_gb(),
+                exc_type.__name__,
             )
 
 
 def _stage(name: str) -> _Stage:
     return _Stage(name)
+
+
+class _Heartbeat:
+    """Background-thread heartbeat for long-running stages.
+
+    Inside a ``with _heartbeat(name)`` block, a daemon thread emits
+    ``[heartbeat] <name> alive at Ns elapsed (rss=X GB)`` every
+    ``every_seconds`` seconds. Stops on context exit. Daemon thread so
+    the process can exit cleanly even mid-heartbeat.
+
+    Use to keep the workflow log alive during operations that have no
+    natural progress signal — e.g., a multi-minute DuckDB SQL execute,
+    or a multi-file iceberg overwrite. Without this, a healthy
+    long-running stage looks identical to a hung stage in the log.
+    """
+
+    def __init__(self, name: str, every_seconds: float = 60.0) -> None:
+        self.name = name
+        self.every = every_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._start = 0.0
+
+    def __enter__(self) -> _Heartbeat:
+        self._start = time.monotonic()
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, name=f"heartbeat-{self.name}", daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._stop.set()
+        # Don't join the thread — it's a daemon and will exit when the
+        # event is set on its next wait. Joining would add up to one
+        # heartbeat-interval of latency to every stage exit, including
+        # the failure path.
+
+    def _run(self) -> None:
+        # Event.wait returns True if the event was set during the wait,
+        # False if the timeout expired without the event being set.
+        # We want to keep heartbeating until the event is set.
+        while not self._stop.wait(self.every):
+            elapsed = time.monotonic() - self._start
+            logger.info(
+                "[heartbeat] %s alive at %.0fs elapsed (rss=%s)",
+                self.name,
+                elapsed,
+                _rss_gb(),
+            )
+
+
+def _heartbeat(name: str, every_seconds: float = 60.0) -> _Heartbeat:
+    return _Heartbeat(name, every_seconds=every_seconds)
 
 
 @click.group()
@@ -154,6 +240,7 @@ def run(
     workers: int,
 ) -> None:
     """Run the full pipeline: fetch -> download -> parse -> write -> publish."""
+    _configure_logging()
     work_dir = Path(output_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     truncated = max_records is not None and max_records > 0
@@ -264,11 +351,11 @@ def run(
     )
 
     search_index_path = work_dir / "abn-search.parquet"
-    with _stage("build search index"):
+    with _stage("build search index"), _heartbeat("build search index"):
         search_rows = build_search_index(
             paths.main_parquet, paths.trading_parquet, search_index_path
         )
-        click.echo(f"  search index: {search_rows:,} rows -> {search_index_path}")
+        logger.info("  search index: %s rows -> %s", f"{search_rows:,}", search_index_path)
 
     iceberg_summary: dict | None = None
     iceberg_ns = "abr_test" if truncated else "abr"
@@ -439,7 +526,8 @@ def _run_iceberg_step(
         ice_table.refresh()
         is_empty = ice_table.current_snapshot() is None
 
-        with _stage(f"iceberg.{table_key} ({'bootstrap' if is_empty else 'update'})"):
+        stage_label = f"iceberg.{table_key} ({'bootstrap' if is_empty else 'update'})"
+        with _stage(stage_label), _heartbeat(stage_label, every_seconds=30.0):
             if is_empty:
                 summary[table_key] = bootstrap_history_table_arrow(
                     ice_table,
