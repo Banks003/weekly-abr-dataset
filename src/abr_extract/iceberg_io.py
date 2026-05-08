@@ -312,51 +312,72 @@ def _scd2_update_sql(
 ) -> str:
     """Build the SCD2 reconciliation SQL for one history table.
 
+    Hash-first strategy: compute a content hash per row in tiny
+    ``(identity, _h)`` projections of prev_open and snapshot, then do
+    the FULL OUTER JOIN on those two-column relations. The join's hash
+    table holds only ~30 bytes per row instead of the full wide row,
+    which lets DuckDB process 20M-row main relations on a 16 GB runner
+    without spilling the heavy content columns.
+
+    The classification is then re-joined back to the full source rows
+    only at emit time, where each leg is a simple inner-join filter.
+
     Inputs registered in the DuckDB connection: ``prev`` (full prior
     history with SCD2 columns) and ``snapshot`` (the new weekly snapshot,
     base columns only). Bind parameters in order: ``valid_to`` for closed
     rows, ``valid_from`` and ``snapshot_observed_date`` for new versions.
     """
     base_select = ", ".join(base_columns)
-    id_join = " AND ".join(f'po."{c}" = n."{c}"' for c in identity)
+    id_select = ", ".join(f'"{c}"' for c in identity)
+    id_join = " AND ".join(f'p."{c}" = n."{c}"' for c in identity)
     id_using = ", ".join(f'"{c}"' for c in identity)
     id_first = f'"{identity[0]}"'
 
     if content_columns:
-        content_eq = " AND ".join(
-            f'po."{c}" IS NOT DISTINCT FROM n."{c}"' for c in content_columns
-        )
+        # DuckDB's hash() is order-sensitive across multiple args; same arg
+        # tuple → same UBIGINT on both sides. NULLs hash to a deterministic
+        # sentinel, so a (NULL, "ACT") row on prev hashes the same as a
+        # (NULL, "ACT") row on snapshot — content-equal.
+        content_hash_expr = "hash(" + ", ".join(f'"{c}"' for c in content_columns) + ")"
     else:
         # Pure set-membership tables (trading_names): identity match is
-        # always content-equal.
-        content_eq = "TRUE"
+        # always content-equal. Constant collapses the case to "matched".
+        content_hash_expr = "0::BIGINT"
 
     return f"""
     WITH
     prev_open AS (SELECT * FROM prev WHERE valid_to IS NULL),
     prev_closed AS (SELECT * FROM prev WHERE valid_to IS NOT NULL),
-    key_action AS (
+    prev_keyed AS (
+      SELECT {id_select}, {content_hash_expr} AS _h
+      FROM prev_open
+    ),
+    new_keyed AS (
+      SELECT {id_select}, {content_hash_expr} AS _h
+      FROM snapshot
+    ),
+    classified AS (
       SELECT
-        {", ".join(f'coalesce(po."{c}", n."{c}") AS "{c}"' for c in identity)},
+        {", ".join(f'coalesce(p."{c}", n."{c}") AS "{c}"' for c in identity)},
         CASE
-          WHEN po.{id_first} IS NULL THEN 'added'
+          WHEN p.{id_first} IS NULL THEN 'added'
           WHEN n.{id_first} IS NULL THEN 'removed'
-          WHEN ({content_eq}) THEN 'unchanged'
+          WHEN p._h = n._h           THEN 'unchanged'
           ELSE 'changed'
         END AS _action
-      FROM prev_open po
-      FULL OUTER JOIN snapshot n ON {id_join}
+      FROM prev_keyed p
+      FULL OUTER JOIN new_keyed n ON {id_join}
     )
     SELECT * FROM prev_closed
     UNION ALL BY NAME
     SELECT po.* FROM prev_open po
-      JOIN key_action ka USING ({id_using})
-      WHERE ka._action = 'unchanged'
+      JOIN classified cls USING ({id_using})
+      WHERE cls._action = 'unchanged'
     UNION ALL BY NAME
     SELECT po.* REPLACE (CAST(? AS DATE) AS valid_to)
       FROM prev_open po
-      JOIN key_action ka USING ({id_using})
-      WHERE ka._action IN ('changed', 'removed')
+      JOIN classified cls USING ({id_using})
+      WHERE cls._action IN ('changed', 'removed')
     UNION ALL BY NAME
     SELECT
       {base_select},
@@ -364,8 +385,8 @@ def _scd2_update_sql(
       CAST(NULL AS DATE) AS valid_to,
       CAST(? AS DATE) AS snapshot_observed_date
     FROM snapshot n
-      JOIN key_action ka USING ({id_using})
-      WHERE ka._action IN ('changed', 'added')
+      JOIN classified cls USING ({id_using})
+      WHERE cls._action IN ('changed', 'added')
     """
 
 
