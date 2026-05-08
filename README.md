@@ -15,7 +15,16 @@ This project fills the gap: a fresh, weekly Parquet drop that any tool with `pya
 
 ## Data
 
-Files are published to a public Cloudflare R2 bucket at `https://gazetteer.au/`. Direct URLs:
+The canonical dataset lives in **Apache Iceberg** on a Cloudflare R2 Data Catalog. Two well-known JSON files at the bucket root expose what's current:
+
+- `https://gazetteer.au/manifest.json` — extract metadata (timestamp, row counts, run id).
+- `https://gazetteer.au/iceberg-snapshot.json` — current Iceberg snapshot id + the public URLs of the live data files for each history table. Read this if you want to query the Iceberg-managed history directly with DuckDB or another reader.
+
+A precomputed search index for keystroke-fast filtering is also published:
+
+- `https://gazetteer.au/abn-search-latest.parquet` — one row per ABN with display columns and a denormalised, lowercased `search_text`. Used by the frontend for the search filter; useful for any consumer that just wants name lookups without joining main + trading.
+
+### Legacy static dumps (under review)
 
 ```
 https://gazetteer.au/abn-main-latest.parquet
@@ -24,9 +33,9 @@ https://gazetteer.au/abn-dgr-latest.parquet
 https://gazetteer.au/abr-extract-latest.sqlite
 ```
 
-Each refresh also writes a date-stamped copy: `abn-main-2026-05-07.parquet`, etc.
+These predate the Iceberg switch. They're being reviewed as part of [#13](https://github.com/Banks003/weekly-abr-dataset/issues/13) — the long-term answer is "Iceberg + search index for live use, one frozen archival dump for back-compat". If you depend on these URLs, comment on #13 so we don't break you.
 
-A `manifest.json` at the bucket root records the source extract date, row counts, and SHA-256 hashes.
+Each refresh also writes a date-stamped copy of `manifest.json`, `iceberg-snapshot.json`, and `abn-search-latest.parquet` (e.g. `manifest-2026-05-08.json`) for audit history.
 
 ### Schema
 
@@ -42,22 +51,56 @@ Field naming and types follow the convention in `iangow/abn_lookup`'s XSLT trans
 
 ## Usage
 
+### Quick name search (recommended)
+
+```sql
+-- DuckDB
+SELECT abn, name, state, postcode, abn_status
+FROM read_parquet('https://gazetteer.au/abn-search-latest.parquet')
+WHERE search_text ILIKE '%acme%'
+LIMIT 10;
+```
+
+The search index carries display fields + a pre-lowercased `search_text` column. One ILIKE replaces the multi-relation join the old static dumps required.
+
+### Querying the live Iceberg dataset
+
+```python
+import json, urllib.request
+import duckdb
+
+snap = json.load(urllib.request.urlopen("https://gazetteer.au/iceberg-snapshot.json"))
+main_files = snap["tables"]["abn_main_history"]["data_files"]
+
+con = duckdb.connect()
+# valid_to IS NULL filters to the currently-valid SCD2 row per ABN.
+df = con.execute(f"""
+    SELECT abn, main_name, state, gst_status
+    FROM read_parquet({main_files})
+    WHERE valid_to IS NULL AND state = 'VIC' AND gst_status = 'ACT'
+    LIMIT 10
+""").fetchdf()
+```
+
+### Legacy direct-parquet path
+
+The historical `abn-main-latest.parquet` URL still resolves, pending [#13](https://github.com/Banks003/weekly-abr-dataset/issues/13):
+
 ```python
 import polars as pl
 
 df = pl.read_parquet("https://gazetteer.au/abn-main-latest.parquet")
 ```
 
-```sql
--- DuckDB
-SELECT * FROM read_parquet('https://gazetteer.au/abn-main-latest.parquet')
-WHERE state = 'VIC' AND gst_status = 'ACT'
-LIMIT 10;
-```
+## Architecture
+
+See [`docs/architecture.md`](docs/architecture.md) for the full system map: data flow per refresh, R2 bucket layout, producer/consumer matrix, growth model, and the open work register. The companion issue tracker mirroring open items is [#21](https://github.com/Banks003/weekly-abr-dataset/issues/21).
 
 ## Refresh schedule
 
 Pipeline runs weekly on GitHub Actions (Sundays UTC, after the ABR's typical mid-week publish). Idempotent — if the source extract is unchanged from the last run, the pipeline exits early without re-uploading.
+
+The CLI prints stage markers like `[stage] iceberg.abn_main_history (update) starting (rss=2.34 GB)` to stderr around each major step. Failed runs in CI also produce a `refresh-debug-{run_id}` artifact with kernel logs, memory state, and partial work-dir contents.
 
 ## Local development
 
