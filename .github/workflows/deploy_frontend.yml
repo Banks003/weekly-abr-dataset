@@ -1,0 +1,39 @@
+name: deploy-frontend
+
+# workflow_dispatch only — frontend changes are infrequent and we don't want
+# surprise deploys on every push to master. Triggered manually from the
+# GitHub Actions UI (works on mobile) or via ``gh workflow run``.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Upload frontend assets to R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: |
+          set -x
+          npx --yes wrangler@4 r2 object put weekly-abr-dataset/abns/index.html \
+            --file=frontend/index.html \
+            --content-type="text/html; charset=utf-8" \
+            --remote
+          npx --yes wrangler@4 r2 object put weekly-abr-dataset/robots.txt \
+            --file=frontend/robots.txt \
+            --content-type="text/plain; charset=utf-8" \
+            --remote
+
+      - name: Confirm
+        run: |
+          echo "Live at:"
+          echo "  https://gazetteer.au/abns/index.html"
+          echo "  https://gazetteer.au/robots.txt"
