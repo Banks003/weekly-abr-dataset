@@ -75,12 +75,12 @@ def _configure_logging(level: int = logging.INFO) -> None:
     )
 
 
-def _rss_gb() -> str:
+def _rss_peak_gb() -> str:
     """Best-effort peak RSS in GB. Returns '?' on any error.
 
-    Linux ``ru_maxrss`` is in KB; CI runner is Linux. This is peak RSS
-    (monotonic) not current — useful for "we hit X at some point" not
-    "we are using X right now".
+    Linux ``ru_maxrss`` is in KB; CI runner is Linux. Peak only goes up
+    over the life of the process — useful for "we hit X at some point"
+    but not for "we are using X right now". Pair with :func:`_rss_now_gb`.
     """
     try:
         import resource
@@ -91,11 +91,41 @@ def _rss_gb() -> str:
         return "?"
 
 
+def _rss_now_gb() -> str:
+    """Best-effort *current* RSS in GB by reading ``/proc/self/status``.
+
+    Linux-only. Returns '?' on any error (e.g. on macOS where the file
+    layout differs). Pair with :func:`_rss_peak_gb` to distinguish
+    "memory has dropped, just stuck at peak in the readout" from
+    "process is actively holding this much right now".
+    """
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    # ``VmRSS:    1234 kB``
+                    kb = int(line.split()[1])
+                    return f"{kb / 1e6:.2f} GB"
+    except Exception:
+        pass
+    return "?"
+
+
+def _rss_label() -> str:
+    """Render both current and peak RSS for log output.
+
+    Format: ``rss=2.34 GB peak=12.22 GB``. Either side falls back to '?'
+    on the platform that doesn't support it; the label keeps the same
+    shape so log scrapers don't break.
+    """
+    return f"rss={_rss_now_gb()} peak={_rss_peak_gb()}"
+
+
 class _Stage:
     """Stage marker context manager for the pipeline.
 
-    Logs ``[stage] <name> starting (rss=X GB)`` on entry and
-    ``[stage] <name> done in Ns (rss=Y GB)`` on clean exit, or
+    Logs ``[stage] <name> starting (rss=X GB peak=Y GB)`` on entry and
+    a matching ``done in Ns`` line on clean exit, or
     ``[stage] <name> FAILED after Ns ...`` on exception.
 
     The whole point is that the *last logged line* before any silent
@@ -110,24 +140,24 @@ class _Stage:
 
     def __enter__(self) -> _Stage:
         self.start = time.monotonic()
-        logger.info("[stage] %s starting (rss=%s)", self.name, _rss_gb())
+        logger.info("[stage] %s starting (%s)", self.name, _rss_label())
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         duration = time.monotonic() - self.start
         if exc_type is None:
             logger.info(
-                "[stage] %s done in %.1fs (rss=%s)",
+                "[stage] %s done in %.1fs (%s)",
                 self.name,
                 duration,
-                _rss_gb(),
+                _rss_label(),
             )
         else:
             logger.error(
-                "[stage] %s FAILED after %.1fs (rss=%s): %s",
+                "[stage] %s FAILED after %.1fs (%s): %s",
                 self.name,
                 duration,
-                _rss_gb(),
+                _rss_label(),
                 exc_type.__name__,
             )
 
@@ -140,9 +170,14 @@ class _Heartbeat:
     """Background-thread heartbeat for long-running stages.
 
     Inside a ``with _heartbeat(name)`` block, a daemon thread emits
-    ``[heartbeat] <name> alive at Ns elapsed (rss=X GB)`` every
-    ``every_seconds`` seconds. Stops on context exit. Daemon thread so
-    the process can exit cleanly even mid-heartbeat.
+    ``[heartbeat] <name> alive at Ns elapsed (rss=X GB peak=Y GB)``
+    every ``every_seconds`` seconds. Stops on context exit. Daemon
+    thread so the process can exit cleanly even mid-heartbeat.
+
+    Reading both *current* RSS and *peak* (``ru_maxrss``) is what makes
+    the difference between "memory is climbing, computation is making
+    progress" and "memory plateaued at peak, we're stuck on I/O" —
+    both look like a flat number if you only show one of them.
 
     Use to keep the workflow log alive during operations that have no
     natural progress signal — e.g., a multi-minute DuckDB SQL execute,
@@ -180,10 +215,10 @@ class _Heartbeat:
         while not self._stop.wait(self.every):
             elapsed = time.monotonic() - self._start
             logger.info(
-                "[heartbeat] %s alive at %.0fs elapsed (rss=%s)",
+                "[heartbeat] %s alive at %.0fs elapsed (%s)",
                 self.name,
                 elapsed,
-                _rss_gb(),
+                _rss_label(),
             )
 
 
