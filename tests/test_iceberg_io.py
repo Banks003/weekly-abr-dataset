@@ -275,6 +275,19 @@ def test_build_snapshot_manifest_lists_tables_with_data_files(tables):
 
 
 # Arrow + DuckDB SCD2 update path -------------------------------------------
+#
+# TEMPORARY: synthetic-data scaffolding.
+#
+# These tests use small in-memory rows to validate the SCD2 mechanics
+# (unchanged / changed / added / removed / set-membership) of
+# update_history_table_arrow against a local SQLite-backed iceberg catalog.
+# They cover the *correctness* side of the rewrite.
+#
+# The *real* validation is diffing the next weekly refresh's iceberg table
+# against the prior week — either whole or sliced — and confirming row
+# counts, open/closed transitions, and content equality match expectations.
+# Track the real-data validation in the follow-up issue; remove or shrink
+# this section once that lands.
 
 
 def _write_main_snapshot_parquet(rows: list[dict], path: Path) -> Path:
