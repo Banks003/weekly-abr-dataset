@@ -434,6 +434,43 @@ def test_update_history_table_arrow_trading_set_membership(tables, tmp_path):
     assert closed[0]["valid_to"] == date(2026, 5, 13)
 
 
+def test_update_history_table_arrow_null_content_treated_consistently(tables, tmp_path):
+    """Hash-first SCD2 must treat (NULL, "ACT") the same on both sides.
+
+    Regression check for the hash-based content-equality path. If
+    DuckDB's hash() handled NULLs differently from prev to snapshot
+    (e.g., propagating NULL out of hash() instead of using a sentinel)
+    a row with a NULL content column on both sides would be mis-classified
+    as 'changed' instead of 'unchanged'.
+    """
+    bootstrap_history_table_arrow(
+        tables["abn_main_history"],
+        _write_main_snapshot_parquet(
+            [_main_row(individual_title=None, asic_number=None)],
+            tmp_path / "w1.parquet",
+        ),
+        date(2026, 5, 6),
+    )
+
+    update_history_table_arrow(
+        tables["abn_main_history"],
+        _write_main_snapshot_parquet(
+            [_main_row(individual_title=None, asic_number=None)],
+            tmp_path / "w2.parquet",
+        ),
+        date(2026, 5, 13),
+        base_columns=list(ABN_MAIN_SCHEMA.names),
+        identity=list(MAIN_IDENTITY),
+        content_columns=list(MAIN_CONTENT_COLUMNS),
+    )
+
+    table = tables["abn_main_history"]
+    table.refresh()
+    df = pl.from_arrow(table.scan().to_arrow())
+    assert df.height == 1
+    assert df["valid_to"].to_list() == [None]
+
+
 # Snapshot pruning ----------------------------------------------------------
 
 
