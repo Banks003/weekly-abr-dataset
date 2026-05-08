@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -186,41 +187,6 @@ def ensure_history_tables(catalog: Catalog, namespace: str = "abr") -> dict[str,
     }
 
 
-def update_history_table(
-    table: Table,
-    snapshot_df: pl.DataFrame,
-    extract_date,
-    *,
-    bootstrap_fn,
-    apply_fn,
-    schema: Schema,
-) -> dict:
-    """Read prev history from Iceberg, apply bootstrap or SCD2 update, write back.
-
-    Returns a small summary dict for the manifest.
-    """
-    table.refresh()
-    try:
-        prev = pl.from_arrow(table.scan().to_arrow())
-    except Exception:
-        prev = pl.DataFrame()
-
-    if prev.height == 0:
-        history = bootstrap_fn(snapshot_df, extract_date)
-    else:
-        history = apply_fn(prev, snapshot_df, extract_date)
-
-    write_history(table, history, schema=schema)
-
-    open_rows = history.filter(pl.col("valid_to").is_null()).height
-    return {
-        "total_rows": history.height,
-        "open_rows": open_rows,
-        "closed_rows": history.height - open_rows,
-        "bootstrap": prev.height == 0,
-    }
-
-
 # Iceberg snapshot manifest (M10) -----------------------------------------------
 
 def _s3_to_public_url(s3_path: str, bucket: str, public_base_url: str) -> str:
@@ -279,17 +245,7 @@ def build_snapshot_manifest(
     return out
 
 
-# Arrow-direct bootstrap path (M9.x — memory hotfix) ------------------------
-#
-# The polars-based ``update_history_table`` reads a 770MB main parquet into
-# a ~3GB Polars DataFrame, then ``df.to_arrow()`` materialises another ~3GB.
-# On a 16GB GitHub-hosted runner, summed across 3 tables this OOMs and the
-# runner is SIGKILL'd partway through the iceberg step.
-#
-# For the BOOTSTRAP case (no prior history) we don't actually need polars.
-# We can stream the parquet through pyarrow record batches, add the three
-# SCD2 columns per batch, and append to the iceberg table in chunks. Memory
-# stays bounded by the batch size (~50-100MB).
+# Bootstrap (empty-table) path ----------------------------------------------
 
 def bootstrap_history_table_arrow(
     table: Table,
@@ -343,3 +299,190 @@ def bootstrap_history_table_arrow(
     table.overwrite(arrow_table)
 
     return {"mode": "bootstrap", "rows_written": n, "batches": 1}
+
+
+# Arrow + DuckDB SCD2 update path -------------------------------------------
+
+
+def _scd2_update_sql(
+    *,
+    base_columns: list[str],
+    identity: list[str],
+    content_columns: list[str],
+) -> str:
+    """Build the SCD2 reconciliation SQL for one history table.
+
+    Inputs registered in the DuckDB connection: ``prev`` (full prior
+    history with SCD2 columns) and ``snapshot`` (the new weekly snapshot,
+    base columns only). Bind parameters in order: ``valid_to`` for closed
+    rows, ``valid_from`` and ``snapshot_observed_date`` for new versions.
+    """
+    base_select = ", ".join(base_columns)
+    id_join = " AND ".join(f'po."{c}" = n."{c}"' for c in identity)
+    id_using = ", ".join(f'"{c}"' for c in identity)
+    id_first = f'"{identity[0]}"'
+
+    if content_columns:
+        content_eq = " AND ".join(
+            f'po."{c}" IS NOT DISTINCT FROM n."{c}"' for c in content_columns
+        )
+    else:
+        # Pure set-membership tables (trading_names): identity match is
+        # always content-equal.
+        content_eq = "TRUE"
+
+    return f"""
+    WITH
+    prev_open AS (SELECT * FROM prev WHERE valid_to IS NULL),
+    prev_closed AS (SELECT * FROM prev WHERE valid_to IS NOT NULL),
+    key_action AS (
+      SELECT
+        {", ".join(f'coalesce(po."{c}", n."{c}") AS "{c}"' for c in identity)},
+        CASE
+          WHEN po.{id_first} IS NULL THEN 'added'
+          WHEN n.{id_first} IS NULL THEN 'removed'
+          WHEN ({content_eq}) THEN 'unchanged'
+          ELSE 'changed'
+        END AS _action
+      FROM prev_open po
+      FULL OUTER JOIN snapshot n ON {id_join}
+    )
+    SELECT * FROM prev_closed
+    UNION ALL BY NAME
+    SELECT po.* FROM prev_open po
+      JOIN key_action ka USING ({id_using})
+      WHERE ka._action = 'unchanged'
+    UNION ALL BY NAME
+    SELECT po.* REPLACE (CAST(? AS DATE) AS valid_to)
+      FROM prev_open po
+      JOIN key_action ka USING ({id_using})
+      WHERE ka._action IN ('changed', 'removed')
+    UNION ALL BY NAME
+    SELECT
+      {base_select},
+      CAST(? AS DATE) AS valid_from,
+      CAST(NULL AS DATE) AS valid_to,
+      CAST(? AS DATE) AS snapshot_observed_date
+    FROM snapshot n
+      JOIN key_action ka USING ({id_using})
+      WHERE ka._action IN ('changed', 'added')
+    """
+
+
+def update_history_table_arrow(
+    table: Table,
+    snapshot_parquet_path,
+    extract_date,
+    *,
+    base_columns: list[str],
+    identity: list[str],
+    content_columns: list[str],
+    duckdb_memory_limit: str = "8GB",
+    duckdb_temp_dir: str | None = None,
+) -> dict:
+    """SCD2 update via Arrow + DuckDB. No Polars round-trip.
+
+    Reads prior history from the Iceberg table as an Arrow record-batch
+    reader, reads the new snapshot parquet directly with DuckDB, executes
+    the SCD2 reconciliation SQL, and writes the result back via
+    ``table.overwrite``.
+    """
+    import duckdb
+
+    table.refresh()
+    prev_reader = table.scan().to_arrow_batch_reader()
+
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute(f"PRAGMA memory_limit='{duckdb_memory_limit}'")
+        if duckdb_temp_dir:
+            con.execute(f"PRAGMA temp_directory='{duckdb_temp_dir}'")
+        con.register("prev", prev_reader)
+        # Materialise the snapshot via DuckDB's native parquet reader so the
+        # SCD2 query can reference it twice (key_action + final SELECT)
+        # without re-decoding the file.
+        con.execute(
+            "CREATE TEMP TABLE snapshot AS "
+            "SELECT * FROM read_parquet(?)",
+            [str(snapshot_parquet_path)],
+        )
+
+        sql = _scd2_update_sql(
+            base_columns=base_columns,
+            identity=identity,
+            content_columns=content_columns,
+        )
+        result = con.execute(sql, [extract_date, extract_date, extract_date]).to_arrow_table()
+    finally:
+        con.close()
+
+    arrow = result.cast(table.schema().as_arrow())
+    n = arrow.num_rows
+    table.overwrite(arrow)
+
+    return {"mode": "update", "rows_written": n}
+
+
+# Snapshot pruning ----------------------------------------------------------
+#
+# Iceberg's ``table.overwrite`` writes a fresh snapshot pointing at new
+# data files; the previous snapshot's data files stay on R2 indefinitely
+# unless we explicitly expire and clean them up. Without pruning, R2
+# storage grows by ~770MB (main) + smaller (trading + dgr) every week
+# even though the live row count is constant.
+#
+# ``expire_snapshots`` here is a *metadata* operation: it removes expired
+# snapshots from the table's snapshot log so they're no longer reachable
+# via time-travel. Physically deleting the orphaned data files from R2
+# requires a separate listing pass (PyIceberg 0.11 has no built-in
+# orphan-file remover); see docs in the cleanup issue for the one-shot
+# script. Running ``expire_snapshots`` on every refresh keeps the
+# snapshot log bounded so future orphan-file passes don't have to chase
+# a runaway list.
+
+DEFAULT_SNAPSHOT_KEEP = 2
+
+
+def prune_iceberg_snapshots(
+    table: Table,
+    *,
+    keep: int = DEFAULT_SNAPSHOT_KEEP,
+    older_than: timedelta | None = None,
+) -> dict:
+    """Expire snapshots beyond the most-recent ``keep`` from the table metadata.
+
+    Always-protected snapshots (the current branch HEAD) are skipped by
+    PyIceberg's expire-snapshots machinery, so we don't need to filter
+    them out explicitly. ``older_than`` adds a grace period: a snapshot
+    is only eligible for expiry if it is also older than the supplied
+    duration (defaults to no grace, i.e. expire immediately once we have
+    ``keep`` newer snapshots).
+    """
+    table.refresh()
+    snapshots = list(table.metadata.snapshots)
+    if len(snapshots) <= keep:
+        return {"expired": 0, "kept": len(snapshots)}
+
+    snapshots.sort(key=lambda s: s.timestamp_ms, reverse=True)
+    candidates = snapshots[keep:]
+
+    if older_than is not None:
+        cutoff_ms = int(
+            (datetime.now(tz=UTC) - older_than).timestamp() * 1000
+        )
+        candidates = [s for s in candidates if s.timestamp_ms < cutoff_ms]
+
+    if not candidates:
+        return {"expired": 0, "kept": len(snapshots)}
+
+    expirer = table.maintenance.expire_snapshots()
+    for snap in candidates:
+        try:
+            expirer = expirer.by_id(snap.snapshot_id)
+        except ValueError:
+            # Protected (branch HEAD / tag) — silently skip; the maintenance
+            # API would refuse to expire these anyway.
+            continue
+    expirer.commit()
+
+    return {"expired": len(candidates), "kept": len(snapshots) - len(candidates)}

@@ -7,6 +7,10 @@ import polars as pl
 import pytest
 
 from abr_extract.history import (
+    MAIN_CONTENT_COLUMNS,
+    MAIN_IDENTITY,
+    TRADING_CONTENT_COLUMNS,
+    TRADING_IDENTITY,
     apply_update_main,
     apply_update_trading,
     bootstrap_main,
@@ -16,9 +20,16 @@ from abr_extract.iceberg_io import (
     ABN_MAIN_HISTORY_SCHEMA,
     ABN_TRADING_HISTORY_SCHEMA,
     TABLE_SCHEMAS,
+    bootstrap_history_table_arrow,
     connect_local_catalog,
     ensure_history_tables,
+    prune_iceberg_snapshots,
+    update_history_table_arrow,
     write_history,
+)
+from abr_extract.schema import (
+    ABN_MAIN_SCHEMA,
+    ABN_TRADING_NAMES_SCHEMA,
 )
 
 
@@ -261,3 +272,208 @@ def test_build_snapshot_manifest_lists_tables_with_data_files(tables):
     trading_block = out["tables"]["abn_trading_names_history"]
     assert trading_block["row_count"] == 0
     assert trading_block["data_files"] == []
+
+
+# Arrow + DuckDB SCD2 update path -------------------------------------------
+#
+# TEMPORARY: synthetic-data scaffolding.
+#
+# These tests use small in-memory rows to validate the SCD2 mechanics
+# (unchanged / changed / added / removed / set-membership) of
+# update_history_table_arrow against a local SQLite-backed iceberg catalog.
+# They cover the *correctness* side of the rewrite.
+#
+# The *real* validation is diffing the next weekly refresh's iceberg table
+# against the prior week — either whole or sliced — and confirming row
+# counts, open/closed transitions, and content equality match expectations.
+# Track the real-data validation in the follow-up issue; remove or shrink
+# this section once that lands.
+
+
+def _write_main_snapshot_parquet(rows: list[dict], path: Path) -> Path:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pq.write_table(pa.Table.from_pylist(rows, schema=ABN_MAIN_SCHEMA), path)
+    return path
+
+
+def _write_trading_snapshot_parquet(rows: list[dict], path: Path) -> Path:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pq.write_table(pa.Table.from_pylist(rows, schema=ABN_TRADING_NAMES_SCHEMA), path)
+    return path
+
+
+def test_update_history_table_arrow_unchanged_keeps_open_rows(tables, tmp_path):
+    snapshot = _main_row()
+    parquet_path = _write_main_snapshot_parquet([snapshot], tmp_path / "snap1.parquet")
+    bootstrap_history_table_arrow(
+        tables["abn_main_history"], parquet_path, date(2026, 5, 6)
+    )
+
+    parquet_path2 = _write_main_snapshot_parquet([snapshot], tmp_path / "snap2.parquet")
+    summary = update_history_table_arrow(
+        tables["abn_main_history"],
+        parquet_path2,
+        date(2026, 5, 13),
+        base_columns=list(ABN_MAIN_SCHEMA.names),
+        identity=list(MAIN_IDENTITY),
+        content_columns=list(MAIN_CONTENT_COLUMNS),
+    )
+    assert summary["mode"] == "update"
+    assert summary["rows_written"] == 1
+
+    table = tables["abn_main_history"]
+    table.refresh()
+    df = pl.from_arrow(table.scan().to_arrow())
+    assert df.height == 1
+    assert df["valid_to"].to_list() == [None]
+
+
+def test_update_history_table_arrow_changed_field_closes_old_opens_new(tables, tmp_path):
+    bootstrap_history_table_arrow(
+        tables["abn_main_history"],
+        _write_main_snapshot_parquet([_main_row(state="NSW")], tmp_path / "w1.parquet"),
+        date(2026, 5, 6),
+    )
+
+    update_history_table_arrow(
+        tables["abn_main_history"],
+        _write_main_snapshot_parquet([_main_row(state="VIC")], tmp_path / "w2.parquet"),
+        date(2026, 5, 13),
+        base_columns=list(ABN_MAIN_SCHEMA.names),
+        identity=list(MAIN_IDENTITY),
+        content_columns=list(MAIN_CONTENT_COLUMNS),
+    )
+
+    table = tables["abn_main_history"]
+    table.refresh()
+    df = pl.from_arrow(table.scan().to_arrow())
+    assert df.height == 2
+    closed = df.filter(pl.col("valid_to").is_not_null()).to_dicts()
+    open_rows = df.filter(pl.col("valid_to").is_null()).to_dicts()
+    assert len(closed) == 1 and closed[0]["state"] == "NSW"
+    assert closed[0]["valid_to"] == date(2026, 5, 13)
+    assert len(open_rows) == 1 and open_rows[0]["state"] == "VIC"
+    assert open_rows[0]["valid_from"] == date(2026, 5, 13)
+
+
+def test_update_history_table_arrow_added_and_removed(tables, tmp_path):
+    bootstrap_history_table_arrow(
+        tables["abn_main_history"],
+        _write_main_snapshot_parquet(
+            [_main_row(abn="11111111111"), _main_row(abn="22222222222")],
+            tmp_path / "w1.parquet",
+        ),
+        date(2026, 5, 6),
+    )
+
+    update_history_table_arrow(
+        tables["abn_main_history"],
+        _write_main_snapshot_parquet(
+            [_main_row(abn="11111111111"), _main_row(abn="33333333333")],
+            tmp_path / "w2.parquet",
+        ),
+        date(2026, 5, 13),
+        base_columns=list(ABN_MAIN_SCHEMA.names),
+        identity=list(MAIN_IDENTITY),
+        content_columns=list(MAIN_CONTENT_COLUMNS),
+    )
+
+    table = tables["abn_main_history"]
+    table.refresh()
+    df = pl.from_arrow(table.scan().to_arrow()).sort("abn")
+    rows = df.to_dicts()
+    by_abn = {r["abn"]: r for r in rows}
+    assert by_abn["11111111111"]["valid_to"] is None
+    assert by_abn["22222222222"]["valid_to"] == date(2026, 5, 13)
+    assert by_abn["33333333333"]["valid_to"] is None
+    assert by_abn["33333333333"]["valid_from"] == date(2026, 5, 13)
+
+
+def test_update_history_table_arrow_trading_set_membership(tables, tmp_path):
+    bootstrap_history_table_arrow(
+        tables["abn_trading_names_history"],
+        _write_trading_snapshot_parquet(
+            [
+                {"abn": "11111111111", "name": "ACME", "name_type": "BN"},
+                {"abn": "11111111111", "name": "ACME PRODUCTS", "name_type": "BN"},
+            ],
+            tmp_path / "t1.parquet",
+        ),
+        date(2026, 5, 6),
+        record_last_updated_column=None,
+    )
+
+    update_history_table_arrow(
+        tables["abn_trading_names_history"],
+        _write_trading_snapshot_parquet(
+            [
+                {"abn": "11111111111", "name": "ACME", "name_type": "BN"},
+                {"abn": "11111111111", "name": "ACME GLOBAL", "name_type": "BN"},
+            ],
+            tmp_path / "t2.parquet",
+        ),
+        date(2026, 5, 13),
+        base_columns=list(ABN_TRADING_NAMES_SCHEMA.names),
+        identity=list(TRADING_IDENTITY),
+        content_columns=list(TRADING_CONTENT_COLUMNS),
+    )
+
+    table = tables["abn_trading_names_history"]
+    table.refresh()
+    df = pl.from_arrow(table.scan().to_arrow()).sort(["name", "valid_from"])
+    rows = df.to_dicts()
+    names_seen = {r["name"] for r in rows}
+    assert names_seen == {"ACME", "ACME PRODUCTS", "ACME GLOBAL"}
+    closed = [r for r in rows if r["valid_to"] is not None]
+    assert len(closed) == 1
+    assert closed[0]["name"] == "ACME PRODUCTS"
+    assert closed[0]["valid_to"] == date(2026, 5, 13)
+
+
+# Snapshot pruning ----------------------------------------------------------
+
+
+def test_prune_iceberg_snapshots_keeps_recent_n(tables, tmp_path):
+    """After multiple weekly overwrites, pruning should leave only ``keep`` snapshots."""
+    table = tables["abn_main_history"]
+    weeks = [
+        (date(2026, 5, 6), "NSW"),
+        (date(2026, 5, 13), "VIC"),
+        (date(2026, 5, 20), "QLD"),
+        (date(2026, 5, 27), "WA"),
+    ]
+    for i, (extract_date, st) in enumerate(weeks):
+        snapshot = pl.DataFrame([_main_row(state=st)])
+        history = bootstrap_main(snapshot, extract_date) if i == 0 else (
+            apply_update_main(
+                pl.from_arrow(table.scan().to_arrow()), snapshot, extract_date
+            )
+        )
+        write_history(table, history, schema=ABN_MAIN_HISTORY_SCHEMA)
+        table.refresh()
+
+    pre_count = len(list(table.metadata.snapshots))
+    assert pre_count >= 4
+
+    summary = prune_iceberg_snapshots(table, keep=2)
+    assert summary["expired"] == pre_count - 2
+
+    table.refresh()
+    assert len(list(table.metadata.snapshots)) == 2
+
+
+def test_prune_iceberg_snapshots_noop_when_under_threshold(tables, tmp_path):
+    """A table with fewer snapshots than ``keep`` is left untouched."""
+    table = tables["abn_main_history"]
+    snapshot = pl.DataFrame([_main_row()])
+    history = bootstrap_main(snapshot, date(2026, 5, 6))
+    write_history(table, history, schema=ABN_MAIN_HISTORY_SCHEMA)
+    table.refresh()
+
+    summary = prune_iceberg_snapshots(table, keep=5)
+    assert summary["expired"] == 0
+    assert summary["kept"] == 1

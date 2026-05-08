@@ -15,6 +15,7 @@ dependencies = [
     "boto3>=1.35.0",
     "tqdm>=4.66.0",
     "pyiceberg[pyarrow,sql-sqlite]>=0.7",
+    "duckdb>=1.5.2",
 ]
 
 [project.scripts]
@@ -22,7 +23,6 @@ abr-extract = "abr_extract.cli:main"
 
 [dependency-groups]
 dev = [
-    "duckdb>=1.5.2",
     "moto[s3]>=5.2.0",
     "psutil>=7.2.2",
     "pytest>=8.0.0",
