@@ -502,6 +502,13 @@
   let totalRows = 0;
   let manifestRowCount = null;
 
+  // When a filter is applied, only count up to this many pages worth of
+  // matches. A broad query like "trading" matches millions of rows; the
+  // user can't reasonably scroll past the first few pages, and an exact
+  // total would force a full scan of the search index on every keystroke.
+  // Display the count as "N+" once the cap is hit.
+  const COUNT_CAP_PAGES = 3;
+
   const MONTHS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
 
   function formatEditionDate(iso) {
@@ -588,12 +595,17 @@
     return { where: filters.length ? `WHERE ${filters.join(' AND ')}` : '', params };
   }
 
-  async function countRows({ where, params }) {
-    // Filter count comes from the search index — one row per ABN.
-    const stmt = await conn.prepare(`SELECT COUNT(*) AS n FROM ${SEARCH_SOURCE} ${where}`);
-    const result = await stmt.query(...params);
+  async function countRows({ where, params }, cap) {
+    // Bounded count: wrap the filter in a LIMIT so DuckDB stops scanning
+    // once it's seen `cap` matching rows. The caller decides whether the
+    // returned count is exact or capped.
+    const stmt = await conn.prepare(
+      `SELECT COUNT(*) AS n FROM (SELECT 1 FROM ${SEARCH_SOURCE} ${where} LIMIT ?) t`
+    );
+    const result = await stmt.query(...params, cap);
     await stmt.close();
-    return Number(result.toArray()[0].toJSON().n);
+    const n = Number(result.toArray()[0].toJSON().n);
+    return { count: n, capped: n >= cap };
   }
 
   async function fetchPage({ where, params }, offset, limit, filtered) {
@@ -742,14 +754,24 @@
       status.className = 'status';
       status.textContent = 'Counting matches…';
 
-      totalRows = await countRows(filterSpec);
+      const cap = pageSize * COUNT_CAP_PAGES + 1;
+      const { count, capped } = await countRows(filterSpec, cap);
+      totalRows = capped ? cap - 1 : count;
       const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
-      if (currentPage >= totalPages) currentPage = 0;
-      pageInfo.innerHTML = `Page ${(currentPage + 1).toLocaleString()} of ${totalPages.toLocaleString()} &nbsp;·&nbsp; ${totalRows.toLocaleString()} matches`;
+      if (!capped && currentPage >= totalPages) currentPage = 0;
+      const matchesText = capped
+        ? `${totalRows.toLocaleString()}+ matches`
+        : `${totalRows.toLocaleString()} matches`;
+      const pagesText = capped
+        ? `${totalPages.toLocaleString()}+`
+        : totalPages.toLocaleString();
+      pageInfo.innerHTML = `Page ${(currentPage + 1).toLocaleString()} of ${pagesText} &nbsp;·&nbsp; ${matchesText}`;
       $('prev').disabled = currentPage === 0;
-      $('next').disabled = (currentPage + 1) >= totalPages;
+      $('next').disabled = capped
+        ? records.length < pageSize
+        : (currentPage + 1) >= totalPages;
       status.className = 'status ready';
-      status.textContent = `Ready · ${totalRows.toLocaleString()} matches`;
+      status.textContent = `Ready · ${matchesText}`;
     } catch (err) {
       status.className = 'status error';
       status.textContent = `Error: ${err.message ?? err}`;
