@@ -94,6 +94,9 @@ ORDER BY search_text, m.abn
 """
 
 
+_ROW_GROUP_SIZE = 50_000
+
+
 def build_search_index(
     main_parquet: Path,
     trading_parquet: Path,
@@ -131,13 +134,16 @@ def build_search_index(
             compression="snappy",
             # Small row groups + per-page stats let DuckDB-WASM prune by
             # ``search_text`` zone maps for prefix queries.
-            row_group_size=50_000,
+            row_group_size=_ROW_GROUP_SIZE,
             write_page_index=True,
             sorting_columns=[pq.SortingColumn(column_index=search_text_idx)],
             # Bloom filter on the high-cardinality ``abn`` column so the
             # 11-digit exact-lookup path can skip every row group except
-            # the one containing the match.
-            bloom_filter_options={"abn": True},
+            # the one containing the match. Size NDV to the row-group
+            # population (one ABN per row, all distinct) — the pyarrow
+            # default of 1M-NDV is sized for whole-file uniqueness and
+            # would inflate each bloom ~20x for our 50k-row groups.
+            bloom_filter_options={"abn": {"ndv": _ROW_GROUP_SIZE, "fpp": 0.05}},
         )
     finally:
         duck.close()
